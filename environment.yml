@@ -1,0 +1,50 @@
+# Conda environment for SuperWater.
+#
+# This installs the heavy / compiled scientific dependencies that are awkward or
+# impossible to install from PyPI:
+#   * PyTorch 2.5.1 built against CUDA 11.8        (pytorch / nvidia channels)
+#   * e3nn 0.5.4                                   (conda-forge -- no longer on PyPI)
+#   * rdkit, openbabel, biopython, numpy, scipy …  (conda-forge)
+# The pure-Python packages are pulled in from requirements.txt (pip section below).
+#
+# The compiled PyTorch Geometric extension wheels (torch-cluster / torch-scatter /
+# torch-sparse / torch-spline-conv) are NOT installed here -- they need the PyG
+# wheel index and are installed separately (see requirements-pyg-cu118.txt /
+# scripts/install.sh).
+#
+# Recommended one-shot setup:   bash scripts/install.sh
+# Manual:                       conda env create -f environment.yml
+#                               conda activate superwater
+#                               pip install -r requirements-pyg-cu118.txt
+#                               pip install -e .
+
+name: superwater
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  # --- PyTorch 2.5.1 + CUDA 11.8 ---
+  - pytorch=2.5.1
+  - pytorch-cuda=11.8
+  - torchvision=0.20.1
+  - torchaudio=2.5.1
+  # --- equivariant NN library (conda-forge; PyPI no longer ships 0.5.4) ---
+  - e3nn=0.5.4
+  # --- scientific stack ---
+  - numpy
+  - scipy
+  - pandas
+  - scikit-learn
+  - networkx
+  - pyyaml
+  - tqdm
+  # --- structural biology / cheminformatics ---
+  - biopython
+  - rdkit
+  - openbabel
+  # --- pure-Python deps from PyPI ---
+  - pip:
+      - -r requirements.txt

@@ -1,0 +1,21 @@
+input:
+  structure_dir: examples/data/single_4h0b
+  name: null
+models:
+  score_model_dir: models/water_score_res15
+  confidence_model_dir: models/water_confidence_res15_sigmoid
+output:
+  output_dir: outputs/predictions
+  overwrite: true
+  format: pdb
+  include_protein: true
+runtime:
+  device: cuda
+  seed: 42
+prediction:
+  water_ratio: 10
+  inference_steps: 20
+  confidence_cutoff: 0.1
+  batch_size: 1
+  save_structure: true
+  save_filtered: true
