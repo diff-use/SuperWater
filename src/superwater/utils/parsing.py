@@ -26,6 +26,7 @@ def parse_train_args(argv=None):
     parser.add_argument('--cudnn_benchmark', action='store_true', default=False, help='CUDA optimization parameter for faster training')
     parser.add_argument('--num_dataloader_workers', type=int, default=0, help='Number of workers for dataloader')
     parser.add_argument('--pin_memory', action='store_true', default=False, help='pin_memory arg of dataloader')
+    parser.add_argument('--checkpoint_freq', type=int, default=0, help='Save a numbered checkpoint every N epochs. 0 disables.')
 
     # Training arguments
     parser.add_argument('--n_epochs', type=int, default=400, help='Number of epochs for training')

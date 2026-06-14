@@ -77,6 +77,10 @@ def train(args, model, optimizer, scheduler, ema_weights, train_loader, val_load
             'ema_weights': ema_weights.state_dict(),
         }, os.path.join(run_dir, 'last_model.pt'))
 
+        if args.checkpoint_freq > 0 and (epoch + 1) % args.checkpoint_freq == 0:
+            torch.save(state_dict, os.path.join(run_dir, f'model_epoch{epoch + 1}.pt'))
+            torch.save(ema_state_dict, os.path.join(run_dir, f'ema_model_epoch{epoch + 1}.pt'))
+
     print("Best Validation Loss {} on Epoch {}".format(best_val_loss, best_epoch))
 
 def set_seed(seed: int = 42) -> None:

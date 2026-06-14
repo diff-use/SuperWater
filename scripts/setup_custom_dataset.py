@@ -179,9 +179,13 @@ def process_one(job):
     protein_path = dest / f"{entry.norm}_protein_processed.pdb"
     water_path = dest / f"{entry.norm}_water.pdb"
 
-    io = PDBIO()
-    io.set_structure(structure)
-    io.save(str(protein_path), ProteinOnly())
+    try:
+        io = PDBIO()
+        io.set_structure(structure)
+        io.save(str(protein_path), ProteinOnly())
+    except Exception as exc:
+        print(f"[SKIP] {entry.norm}: write_error — {exc}")
+        return entry.norm, "write_error", str(exc)
     write_water_pdb(waters, water_path)
 
     meta = f"{source}\t{len(waters)}\t{protein_path}\t{water_path}"
@@ -231,7 +235,7 @@ def main(argv=None):
     out_dir = Path(args.out_dir).expanduser().resolve()
     split_out_dir = Path(args.split_out_dir).expanduser().resolve()
     embeddings_dir = Path(args.embeddings_dir).expanduser().resolve() if args.embeddings_dir else Path(str(out_dir) + "_embeddings")
-    logs_dir = Path(args.logs_dir).expanduser().resolve() if args.logs_dir else Path(str(out_dir) + "_setup_logs")
+    logs_dir = Path(args.logs_dir).expanduser().resolve() if args.logs_dir else out_dir / "logs"
 
     splits = {
         "train": read_split(args.split_train),

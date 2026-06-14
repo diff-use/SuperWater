@@ -34,7 +34,7 @@ def get_chain_sequences(pdb_path):
     chains so that chain indices stay aligned with the receptor graph builder.
     """
     from superwater.structure_io import parse_structure
-    structure = parse_structure(pdb_path, structure_id='protein')[0]
+    structure = parse_structure(pdb_path, permissive=True, structure_id='protein')[0]
     sequences = []
     for chain in structure:
         seq = ''
@@ -79,10 +79,24 @@ def embed_dataset(data_dir, out_dir, device, truncation=TRUNCATION_SEQ_LENGTH):
     model, alphabet = load_esm_model(device)
     from superwater.structure_io import structure_path
     names = sorted(d for d in os.listdir(data_dir) if os.path.isdir(os.path.join(data_dir, d)))
+    skipped = []
     for name in names:
         pdb_path = structure_path(os.path.join(data_dir, name), name, "_protein_processed")
         if not os.path.exists(pdb_path):
-            print(f"Skipping {name}: {pdb_path} not found")
+            reason = f"_protein_processed not found at {pdb_path}"
+            print(f"[SKIP] {name}: {reason}")
+            skipped.append((name, reason))
             continue
         print(f"Embedding {name} ...")
-        embed_complex(name, pdb_path, out_dir, model, alphabet, device, truncation)
+        try:
+            embed_complex(name, pdb_path, out_dir, model, alphabet, device, truncation)
+        except Exception as exc:
+            print(f"[SKIP] {name}: embedding error — {exc}")
+            skipped.append((name, str(exc)))
+    log_path = os.path.join(data_dir, "logs", "skipped_embedding_errors.txt")
+    os.makedirs(os.path.dirname(log_path), exist_ok=True)
+    with open(log_path, "w") as f:
+        for name, reason in skipped:
+            f.write(f"{name}\t{reason}\n")
+    if skipped:
+        print(f"Wrote {len(skipped)} skipped entries to {log_path}")
