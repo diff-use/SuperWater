@@ -20,7 +20,7 @@ import torch.nn.functional as F
 
 from superwater.datasets.conformer_matching import get_torsion_angles, optimize_rotatable_bonds
 from superwater.utils.torsion import get_transformation_mask
-from superwater.structure_io import structure_path, parse_structure
+from superwater.structure_io import structure_path, parse_structure, candidate_structure_paths
 
 
 biopython_parser_rec = PDBParser(PERMISSIVE=False)
@@ -147,9 +147,18 @@ def parse_receptor(pdbid, pdbbind_dir):
     return rec, rec_lig
 
 def parsePDB(pdbid, pdbbind_dir):
-    # Prefer a native CIF receptor when present, else fall back to the PDB layout.
-    rec_path = structure_path(os.path.join(pdbbind_dir, pdbid), pdbid, '_protein_processed')
-    return parse_pdb_from_path(rec_path)
+    # Prefer a native CIF receptor when present, falling back to the PDB layout if the
+    # CIF is missing or fails to parse.
+    candidates = candidate_structure_paths(os.path.join(pdbbind_dir, pdbid), pdbid, '_protein_processed')
+    if not candidates:
+        raise FileNotFoundError(f"No _protein_processed structure for {pdbid} in {pdbbind_dir}")
+    last_exc = None
+    for path in candidates:
+        try:
+            return parse_pdb_from_path(path)
+        except Exception as exc:  # try the next format (e.g. PDB) before giving up
+            last_exc = exc
+    raise last_exc
 
 def parse_pdb_from_path(path):
     with warnings.catch_warnings():

@@ -16,7 +16,7 @@ from superwater.datasets.process_mols import mol_from_water_pdb, get_rec_graph, 
     get_lig_graph_with_matching, extract_receptor_structure, parse_receptor
 from superwater.utils.diffusion_utils import modify_conformer, set_time
 from superwater.utils.utils import read_strings_from_txt
-from superwater.structure_io import structure_path
+from superwater.structure_io import candidate_structure_paths
 
 
 class NoiseTransform(BaseTransform):
@@ -109,7 +109,7 @@ class PDBBind(Dataset):
 
     def get(self, idx):
         file_path = os.path.join(self.full_cache_path, self.files[idx])
-        data = torch.load(file_path)
+        data = torch.load(file_path, weights_only=False)
         return data
 
     def preprocessing(self, complex_names_all=None):
@@ -118,6 +118,7 @@ class PDBBind(Dataset):
         complex_names_all = self.complex_names if complex_names_all is None else complex_names_all
         print(f'Loading {len(complex_names_all)} complexes.')
 
+        failures = []
         if self.num_workers > 1:
             complex_names = complex_names_all
             if self.num_workers > 1:
@@ -125,8 +126,9 @@ class PDBBind(Dataset):
                 p.__enter__()
             with tqdm(total=len(complex_names), desc=f'loading complexes') as pbar:
                 map_fn = p.imap if self.num_workers > 1 else map
-                for complex, lig in map_fn(self.get_complex, complex_names):
+                for name, complex, lig, error in map_fn(self.get_complex, complex_names):
                     if not complex:
+                        failures.append((name, error or "no complex graphs produced"))
                         pbar.update()
                         continue
                     full_path = os.path.join(self.full_cache_path, f"{complex[0].name}.pt")
@@ -137,16 +139,30 @@ class PDBBind(Dataset):
             complex_names = complex_names_all
 
             with tqdm(total=len(complex_names), desc=f'loading complexes') as pbar:
-                for complex, lig in map(self.get_complex, complex_names):
+                for name, complex, lig, error in map(self.get_complex, complex_names):
                     if not complex:
+                        failures.append((name, error or "no complex graphs produced"))
                         pbar.update()
                         continue
                     full_path = os.path.join(self.full_cache_path, f"{complex[0].name}.pt")
                     torch.save(complex[0], full_path)
                     pbar.update()
+        self._log_failures(failures)
         if self.cache_scope == 'split':
             with open(os.path.join(self.full_cache_path, 'done.txt'), 'w') as file:
                 file.write("done")
+
+    def _log_failures(self, failures):
+        """Append complexes that produced no graph to ``failed_complexes.txt`` in the
+        cache dir, so .pt preprocessing failures leave a durable, inspectable record
+        (the only other trace is a missing ``<name>.pt``)."""
+        if not failures:
+            return
+        log_path = os.path.join(self.full_cache_path, "failed_complexes.txt")
+        with open(log_path, "a") as f:
+            for name, reason in failures:
+                f.write(f"{name}\t{str(reason).splitlines()[0] if reason else ''}\n")
+        print(f"Logged {len(failures)} failed complexes to {log_path}")
         
     def find_lm_embeddings_chains(self, base_name):
         pattern = f"{self.esm_embeddings_path}/{base_name}_chain_*.pt"
@@ -161,25 +177,26 @@ class PDBBind(Dataset):
         lm_embedding_chains = self.find_lm_embeddings_chains(name) if self.esm_embeddings_path else None
         if not os.path.exists(os.path.join(self.pdbbind_dir, name)):
             print("Folder not found", name)
-            return [], []
+            return name, [], [], "folder not found"
         try:
             rec_model, rec_lig_model = parse_receptor(name, self.pdbbind_dir)
         except Exception as e:
             print(f'Skipping {name} because of the error:')
             print(e)
-            return [], []
+            return name, [], [], str(e)
 
         ligs = read_mols(self.pdbbind_dir, name, remove_hs=False)
-        
+
         complex_graphs = []
         failed_indices = []
+        last_error = None
         for i, lig in enumerate(ligs):
             if self.max_lig_size is not None and lig.GetNumHeavyAtoms() > self.max_lig_size:
                 print(f'Ligand with {lig.GetNumHeavyAtoms()} heavy atoms is larger than max_lig_size {self.max_lig_size}. Not including {name} in preprocessed data.')
                 continue
             complex_graph = HeteroData()
             complex_graph['name'] = f"{name}"
-            
+
             try:
                 get_lig_graph_with_matching(lig, complex_graph, self.popsize, self.maxiter, self.matching, self.keep_original,
                                             self.num_conformers, remove_hs=self.remove_hs)
@@ -189,6 +206,7 @@ class PDBBind(Dataset):
                 if lm_embeddings is not None and len(c_alpha_coords) != len(lm_embeddings):
                     print(f'LM embeddings for complex {name} did not have the right length for the protein. Skipping {name}.')
                     failed_indices.append(i)
+                    last_error = "LM embedding length mismatch"
                     continue
 
                 get_rec_graph(rec, rec_lig, rec_coords, all_coords, c_alpha_coords, n_coords, c_coords, complex_graph, rec_radius=self.receptor_radius,
@@ -199,6 +217,7 @@ class PDBBind(Dataset):
                 print(f'Skipping {name} because of the error:')
                 print(e)
                 failed_indices.append(i)
+                last_error = str(e)
                 continue
 
             protein_center = torch.mean(complex_graph['receptor'].pos, dim=0, keepdim=True)
@@ -216,8 +235,9 @@ class PDBBind(Dataset):
             complex_graphs.append(complex_graph)
         for idx_to_delete in sorted(failed_indices, reverse=True):
             del ligs[idx_to_delete]
-        
-        return complex_graphs, ligs
+
+        error = None if complex_graphs else (last_error or "no ligand graphs produced")
+        return name, complex_graphs, ligs, error
 
 def print_statistics(complex_graphs):
     statistics = ([], [], [], [])
@@ -269,11 +289,15 @@ def construct_loader(args, t_to_sigma):
 
 
 def read_mols(pdbbind_dir, name, remove_hs=False):
-    """Build the water "ligand" for a complex from its ``{name}_water.pdb``.
+    """Build the water "ligand" for a complex from its ``{name}_water.{cif,pdb}``.
 
-    Waters are bond-less oxygens, so the PDB carries the same information the old
+    Waters are bond-less oxygens, so the file carries the same information the old
     ``_water.mol2`` did; ``mol_from_water_pdb`` reproduces the original mol2 featurization
-    exactly (see its docstring). No .mol2 file or OpenBabel is required.
+    exactly (see its docstring). No .mol2 file or OpenBabel is required. CIF is preferred,
+    falling back to PDB if the CIF is missing or yields no waters.
     """
-    lig = mol_from_water_pdb(structure_path(os.path.join(pdbbind_dir, name), name, "_water"))
-    return [lig] if lig is not None else []
+    for path in candidate_structure_paths(os.path.join(pdbbind_dir, name), name, "_water"):
+        lig = mol_from_water_pdb(path)
+        if lig is not None:
+            return [lig]
+    return []

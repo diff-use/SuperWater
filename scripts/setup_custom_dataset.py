@@ -12,7 +12,10 @@ both the folder name and file prefix.
 from __future__ import annotations
 
 import argparse
+import shutil
+import tempfile
 import warnings
+import zipfile
 from collections import OrderedDict, defaultdict
 from dataclasses import dataclass
 from functools import partial
@@ -24,7 +27,7 @@ from Bio.PDB.PDBExceptions import PDBConstructionWarning
 from Bio.PDB.PDBIO import Select
 from tqdm import tqdm
 
-from superwater.structure_io import parse_structure
+from superwater.structure_io import parse_structure, candidate_structure_paths
 
 
 SOURCE_EXTS = (".cif", ".mmcif", ".pdb")
@@ -53,7 +56,25 @@ def parse_args(argv=None):
     p.add_argument("--logs_dir", default=None)
     p.add_argument("--num_workers", type=int, default=8)
     p.add_argument("--min_water_dist", type=float, default=1.9)
+    p.add_argument("--out_format", choices=["cif", "pdb"], default="cif",
+                   help="Format for the written _protein_processed and _water files. "
+                        "CIF is the default because legacy PDB cannot hold 5-character "
+                        "ligand CCD codes (e.g. A1ADA) without column overflow.")
     p.add_argument("--skip_embeddings", action="store_true")
+    p.add_argument("--skip_existing", action="store_true",
+                   help="Skip ids that already have output: a complex with both a "
+                        "_protein_processed and a _water file is left untouched, and the "
+                        "embedding stage skips complexes that already have _chain_0.pt. "
+                        "Makes a re-run incremental (only new/missing ids are processed). "
+                        "Note: it does NOT re-fix already-written-but-corrupt files.")
+    p.add_argument("--download_missing", action="store_true",
+                   help="For split ids absent from --raw_data_dir, download the entry's "
+                        "_final.cif/.pdb from PDB-REDO into a temp dir, process it into "
+                        "--out_dir, then delete the downloaded files. (Embedding of the "
+                        "newly-processed complex happens in the normal embedding stage.)")
+    p.add_argument("--tmp_dir", default=None,
+                   help="Base dir for transient PDB-REDO downloads (default: a system "
+                        "temp dir). Per-entry files are deleted right after processing.")
     p.add_argument("--device", default="cuda", choices=["cuda", "cpu"])
     p.add_argument("--build_cache", action="store_true")
     p.add_argument("--cache_path", default=None)
@@ -90,19 +111,101 @@ def unique_entries(splits: dict[str, list[Entry]]) -> list[Entry]:
     return list(entries.values())
 
 
-def resolve_source(raw_root: Path, entry: Entry) -> Path | None:
+def resolve_sources(raw_root: Path, entry: Entry) -> list[Path]:
+    """All existing raw source files for ``entry``, in CIF-first priority order.
+
+    Callers try these in order and fall back to the next (e.g. PDB) when an earlier
+    one fails to parse, so a present-but-corrupt CIF does not lose the complex.
+    """
     folder = raw_root / entry.norm
     raw_stem = Path(entry.raw).stem.lower()
     stems = []
     for stem in (raw_stem, f"{entry.norm}_final", entry.norm):
         if stem not in stems:
             stems.append(stem)
+    found = []
     for ext in SOURCE_EXTS:
         for stem in stems:
             path = folder / f"{stem}{ext}"
             if path.exists():
-                return path
-    return None
+                found.append(path)
+    return found
+
+
+def resolve_source(raw_root: Path, entry: Entry) -> Path | None:
+    sources = resolve_sources(raw_root, entry)
+    return sources[0] if sources else None
+
+
+# Raw sources mirror the PDB-REDO archive layout (<id>_final.cif/.pdb). When a split id
+# is absent from --raw_data_dir we fetch that one entry's ZIP and extract just the
+# structure files; see clustering/download_pdb_redo.py for the fuller downloader.
+PDB_REDO_ZIP_URL = "https://pdb-redo.eu/db/{pdb_id}/zipped"
+_DOWNLOAD_SESSION = None
+
+
+def _download_session():
+    global _DOWNLOAD_SESSION
+    if _DOWNLOAD_SESSION is not None:
+        return _DOWNLOAD_SESSION
+    import requests
+    from requests.adapters import HTTPAdapter
+    from urllib3.util.retry import Retry
+
+    retry = Retry(total=5, connect=5, read=5, status=5, backoff_factor=1.0,
+                  allowed_methods=frozenset({"GET"}),
+                  status_forcelist=(429, 500, 502, 503, 504),
+                  raise_on_status=False, respect_retry_after_header=True)
+    session = requests.Session()
+    session.mount("https://", HTTPAdapter(max_retries=retry))
+    session.headers.update({"User-Agent": "superwater-setup/1.0 (+https://pdb-redo.eu/)"})
+    _DOWNLOAD_SESSION = session
+    return session
+
+
+def download_entry(pdb_id: str, dest_root: Path) -> Path | None:
+    """Download ``<pdb_id>_final.cif`` (and ``.pdb`` when present) from PDB-REDO.
+
+    Extracts into ``dest_root/<pdb_id>/`` so ``resolve_sources`` finds it like a raw dir.
+    Returns the entry dir on success (at least the CIF or PDB present), else ``None``.
+    """
+    pdb_id = pdb_id.lower()
+    entry_dir = Path(dest_root) / pdb_id
+    entry_dir.mkdir(parents=True, exist_ok=True)
+    wanted = {f"{pdb_id}_final.cif", f"{pdb_id}_final.pdb"}
+    url = PDB_REDO_ZIP_URL.format(pdb_id=pdb_id)
+
+    tmp_zip = None
+    try:
+        session = _download_session()
+        with session.get(url, stream=True, timeout=(30, 600)) as resp:
+            resp.raise_for_status()
+            with tempfile.NamedTemporaryFile(prefix="pdbredo_", suffix=".zip", delete=False) as tmp:
+                tmp_zip = Path(tmp.name)
+                for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                    if chunk:
+                        tmp.write(chunk)
+        found = set()
+        with zipfile.ZipFile(tmp_zip) as zf:
+            members = {Path(name).name: name for name in zf.namelist()}
+            for short in wanted:
+                member = members.get(short)
+                if member is None:
+                    continue
+                with zf.open(member) as src, open(entry_dir / short, "wb") as out:
+                    shutil.copyfileobj(src, out, length=1024 * 1024)
+                found.add(short)
+    except Exception:
+        shutil.rmtree(entry_dir, ignore_errors=True)
+        return None
+    finally:
+        if tmp_zip is not None:
+            tmp_zip.unlink(missing_ok=True)
+
+    if not found:
+        shutil.rmtree(entry_dir, ignore_errors=True)
+        return None
+    return entry_dir
 
 
 def is_water_residue(residue) -> bool:
@@ -152,44 +255,109 @@ def write_water_pdb(coords: list[tuple[float, float, float]], path: Path) -> Non
     path.write_text("".join(rows))
 
 
+def write_water_cif(coords: list[tuple[float, float, float]], path: Path) -> None:
+    from Bio.PDB.Structure import Structure
+    from Bio.PDB.Model import Model
+    from Bio.PDB.Chain import Chain
+    from Bio.PDB.Residue import Residue
+    from Bio.PDB.Atom import Atom
+    from Bio.PDB.mmcifio import MMCIFIO
+
+    structure = Structure("water")
+    model = Model(0)
+    chain = Chain("W")
+    for i, (x, y, z) in enumerate(coords, start=1):
+        # ('W', resseq, icode) marks each oxygen as its own water residue.
+        residue = Residue(("W", i, " "), "HOH", " ")
+        residue.add(Atom("O", [x, y, z], 0.0, 1.0, " ", "O", i, "O"))
+        chain.add(residue)
+    model.add(chain)
+    structure.add(model)
+    io = MMCIFIO()
+    io.set_structure(structure)
+    io.save(str(path))
+
+
+def write_protein(structure, path: Path, fmt: str) -> None:
+    """Write the protein (non-HOH residues) to ``path`` in ``fmt`` ('cif' or 'pdb').
+
+    CIF is preferred: BioPython's PDBIO truncates/overflows residue names longer than
+    3 characters, which silently corrupts structures that use the newer 5-character
+    ligand CCD codes (e.g. ``A1ADA``). mmCIF is free-format and round-trips them.
+    """
+    if fmt == "cif":
+        from Bio.PDB.mmcifio import MMCIFIO
+        io = MMCIFIO()
+    else:
+        io = PDBIO()
+    io.set_structure(structure)
+    io.save(str(path), ProteinOnly())
+
+
+def write_water(coords: list[tuple[float, float, float]], path: Path, fmt: str) -> None:
+    if fmt == "cif":
+        write_water_cif(coords, path)
+    else:
+        write_water_pdb(coords, path)
+
+
 def process_one(job):
-    raw_root, out_dir, entry, min_water_dist = job
+    raw_root, out_dir, entry, min_water_dist, out_format, skip_existing, \
+        download_missing, tmp_root = job
     raw_root = Path(raw_root)
     out_dir = Path(out_dir)
-    source = resolve_source(raw_root, entry)
-    if source is None:
-        return entry.norm, "missing_source", ""
-
-    try:
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", PDBConstructionWarning)
-            structure = parse_structure(str(source), permissive=True, structure_id=entry.norm)
-    except Exception as exc:
-        return entry.norm, "parse_error", str(exc)
-
-    if not has_protein_residue(structure):
-        return entry.norm, "no_protein", ""
-
-    waters = extract_water_coords(structure, min_water_dist)
-    if not waters:
-        return entry.norm, "no_waters", ""
-
     dest = out_dir / entry.norm
-    dest.mkdir(parents=True, exist_ok=True)
-    protein_path = dest / f"{entry.norm}_protein_processed.pdb"
-    water_path = dest / f"{entry.norm}_water.pdb"
+    if skip_existing \
+            and candidate_structure_paths(str(dest), entry.norm, "_protein_processed") \
+            and candidate_structure_paths(str(dest), entry.norm, "_water"):
+        return entry.norm, "exists", ""
 
+    downloaded_dir = None  # transient PDB-REDO download to delete once processed
     try:
-        io = PDBIO()
-        io.set_structure(structure)
-        io.save(str(protein_path), ProteinOnly())
-    except Exception as exc:
-        print(f"[SKIP] {entry.norm}: write_error — {exc}")
-        return entry.norm, "write_error", str(exc)
-    write_water_pdb(waters, water_path)
+        sources = resolve_sources(raw_root, entry)
+        if not sources and download_missing and tmp_root is not None:
+            downloaded_dir = download_entry(entry.norm, Path(tmp_root))
+            if downloaded_dir is not None:
+                sources = resolve_sources(Path(tmp_root), entry)
+        if not sources:
+            return entry.norm, "missing_source", ""
 
-    meta = f"{source}\t{len(waters)}\t{protein_path}\t{water_path}"
-    return entry.norm, "ok", meta
+        structure, source, last_exc = None, None, None
+        for candidate in sources:  # CIF first, fall back to PDB if it fails to parse
+            try:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", PDBConstructionWarning)
+                    structure = parse_structure(str(candidate), permissive=True, structure_id=entry.norm)
+                source = candidate
+                break
+            except Exception as exc:
+                last_exc = exc
+        if structure is None:
+            return entry.norm, "parse_error", str(last_exc)
+
+        if not has_protein_residue(structure):
+            return entry.norm, "no_protein", ""
+
+        waters = extract_water_coords(structure, min_water_dist)
+        if not waters:
+            return entry.norm, "no_waters", ""
+
+        dest.mkdir(parents=True, exist_ok=True)
+        protein_path = dest / f"{entry.norm}_protein_processed.{out_format}"
+        water_path = dest / f"{entry.norm}_water.{out_format}"
+
+        try:
+            write_protein(structure, protein_path, out_format)
+        except Exception as exc:
+            print(f"[SKIP] {entry.norm}: write_error — {exc}")
+            return entry.norm, "write_error", str(exc)
+        write_water(waters, water_path, out_format)
+
+        meta = f"{source}\t{len(waters)}\t{protein_path}\t{water_path}"
+        return entry.norm, ("downloaded" if downloaded_dir is not None else "ok"), meta
+    finally:
+        if downloaded_dir is not None:
+            shutil.rmtree(downloaded_dir, ignore_errors=True)
 
 
 def write_lines(path: Path, rows: list[str]) -> None:
@@ -245,26 +413,44 @@ def main(argv=None):
     all_entries = unique_entries(splits)
     print(f"Preparing {len(all_entries)} unique ids from {raw_root}")
 
-    jobs = [(str(raw_root), str(out_dir), entry, args.min_water_dist) for entry in all_entries]
-    prepared, skipped, metadata = set(), defaultdict(list), {}
+    tmp_root = None
+    if args.download_missing:
+        tmp_root = Path(tempfile.mkdtemp(prefix="superwater_dl_",
+                                         dir=args.tmp_dir if args.tmp_dir else None))
 
-    if args.num_workers > 1:
-        with Pool(args.num_workers) as pool:
-            iterator = pool.imap_unordered(process_one, jobs, chunksize=16)
-            for cid, status, meta in tqdm(iterator, total=len(jobs), desc="preparing"):
-                if status == "ok":
-                    prepared.add(cid)
-                    metadata[cid] = meta
-                else:
-                    skipped[status].append(f"{cid}\t{meta}" if meta else cid)
-    else:
-        for job in tqdm(jobs, total=len(jobs), desc="preparing"):
-            cid, status, meta = process_one(job)
-            if status == "ok":
-                prepared.add(cid)
-                metadata[cid] = meta
-            else:
-                skipped[status].append(f"{cid}\t{meta}" if meta else cid)
+    jobs = [(str(raw_root), str(out_dir), entry, args.min_water_dist, args.out_format,
+             args.skip_existing, args.download_missing,
+             str(tmp_root) if tmp_root is not None else None)
+            for entry in all_entries]
+    prepared, skipped, metadata = set(), defaultdict(list), {}
+    n_exists = 0
+    n_downloaded = 0
+
+    def record(cid, status, meta):
+        nonlocal n_exists, n_downloaded
+        if status in ("ok", "downloaded"):
+            prepared.add(cid)
+            metadata[cid] = meta
+            if status == "downloaded":
+                n_downloaded += 1
+        elif status == "exists":  # already on disk -> keep it in the split, don't redo
+            prepared.add(cid)
+            n_exists += 1
+        else:
+            skipped[status].append(f"{cid}\t{meta}" if meta else cid)
+
+    try:
+        if args.num_workers > 1:
+            with Pool(args.num_workers) as pool:
+                iterator = pool.imap_unordered(process_one, jobs, chunksize=16)
+                for cid, status, meta in tqdm(iterator, total=len(jobs), desc="preparing"):
+                    record(cid, status, meta)
+        else:
+            for job in tqdm(jobs, total=len(jobs), desc="preparing"):
+                record(*process_one(job))
+    finally:
+        if tmp_root is not None:
+            shutil.rmtree(tmp_root, ignore_errors=True)
 
     logs_dir.mkdir(parents=True, exist_ok=True)
     for reason, ids in sorted(skipped.items()):
@@ -282,7 +468,13 @@ def main(argv=None):
         split_paths[split_name] = path
         print(f"Wrote {len(ids)} {split_name} ids -> {path}")
 
-    print(f"Prepared {len(prepared)} ids. Logs -> {logs_dir}")
+    extra = []
+    if n_exists:
+        extra.append(f"{n_exists} already existed, skipped")
+    if n_downloaded:
+        extra.append(f"{n_downloaded} downloaded from PDB-REDO")
+    suffix = f" ({'; '.join(extra)})" if extra else ""
+    print(f"Prepared {len(prepared)} ids{suffix}. Logs -> {logs_dir}")
 
     if not args.skip_embeddings:
         import torch
@@ -291,7 +483,8 @@ def main(argv=None):
         if args.device == "cuda" and not torch.cuda.is_available():
             raise SystemExit("CUDA requested for embeddings, but torch.cuda.is_available() is false.")
         print(f"Generating ESM embeddings -> {embeddings_dir}")
-        embed_dataset(str(out_dir), str(embeddings_dir), torch.device(args.device))
+        embed_dataset(str(out_dir), str(embeddings_dir), torch.device(args.device),
+                      skip_existing=args.skip_existing)
 
     if args.build_cache:
         if args.skip_embeddings and not embeddings_dir.exists():

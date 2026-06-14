@@ -74,29 +74,49 @@ def embed_complex(name, pdb_path, out_dir, model, alphabet, device, truncation=T
         torch.save({'representations': {REPR_LAYER: emb}}, os.path.join(out_dir, f"{name}_chain_{i}.pt"))
 
 
-def embed_dataset(data_dir, out_dir, device, truncation=TRUNCATION_SEQ_LENGTH):
-    """Embed every complex in an organized dataset dir (each subfolder is one complex)."""
-    model, alphabet = load_esm_model(device)
-    from superwater.structure_io import structure_path
+def embed_dataset(data_dir, out_dir, device, truncation=TRUNCATION_SEQ_LENGTH,
+                  skip_existing=False):
+    """Embed every complex in an organized dataset dir (each subfolder is one complex).
+
+    With ``skip_existing=True``, complexes that already have a ``<name>_chain_0.pt`` in
+    ``out_dir`` are left untouched, so a re-run only embeds new/missing complexes.
+    """
+    from superwater.structure_io import candidate_structure_paths
     names = sorted(d for d in os.listdir(data_dir) if os.path.isdir(os.path.join(data_dir, d)))
+    model = alphabet = None  # loaded lazily so a fully-skipped re-run does no model load
     skipped = []
+    n_exists = 0
     for name in names:
-        pdb_path = structure_path(os.path.join(data_dir, name), name, "_protein_processed")
-        if not os.path.exists(pdb_path):
-            reason = f"_protein_processed not found at {pdb_path}"
+        if skip_existing and os.path.exists(os.path.join(out_dir, f"{name}_chain_0.pt")):
+            n_exists += 1
+            continue
+        candidates = candidate_structure_paths(os.path.join(data_dir, name), name, "_protein_processed")
+        if not candidates:
+            reason = f"_protein_processed not found in {os.path.join(data_dir, name)}"
             print(f"[SKIP] {name}: {reason}")
             skipped.append((name, reason))
             continue
+        if model is None:
+            model, alphabet = load_esm_model(device)
         print(f"Embedding {name} ...")
-        try:
-            embed_complex(name, pdb_path, out_dir, model, alphabet, device, truncation)
-        except Exception as exc:
-            print(f"[SKIP] {name}: embedding error — {exc}")
-            skipped.append((name, str(exc)))
+        last_exc = None
+        embedded = False
+        for pdb_path in candidates:  # CIF first, fall back to PDB if it fails to parse
+            try:
+                embed_complex(name, pdb_path, out_dir, model, alphabet, device, truncation)
+                embedded = True
+                break
+            except Exception as exc:
+                last_exc = exc
+        if not embedded:
+            print(f"[SKIP] {name}: embedding error — {last_exc}")
+            skipped.append((name, str(last_exc)))
     log_path = os.path.join(data_dir, "logs", "skipped_embedding_errors.txt")
     os.makedirs(os.path.dirname(log_path), exist_ok=True)
     with open(log_path, "w") as f:
         for name, reason in skipped:
             f.write(f"{name}\t{reason}\n")
+    if n_exists:
+        print(f"Skipped {n_exists} complexes that already had embeddings")
     if skipped:
         print(f"Wrote {len(skipped)} skipped entries to {log_path}")

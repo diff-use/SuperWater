@@ -133,20 +133,59 @@ Download the dataset from [Zenodo](https://doi.org/10.5281/zenodo.17229778) (`wa
 
 ```
 data/<dataset>/<PDB_ID>/
-├── <PDB_ID>_protein_processed.pdb
-├── <PDB_ID>_water.mol2
-└── <PDB_ID>_water.pdb
+├── <PDB_ID>_protein_processed.{cif,pdb}
+└── <PDB_ID>_water.{cif,pdb}
 ```
+
+The data layer reads CIF in preference to PDB and falls back to the other format if one is
+missing or fails to parse — for both the raw inputs and the `_protein_processed`/`_water`
+files. CIF is preferred because legacy fixed-column PDB cannot represent the newer
+5-character ligand CCD codes (e.g. `A1ADA`) without corrupting the file.
 
 The paper's train/val/test splits are in `examples/data/splits/` (`train_res15.txt`,
 `val_res15.txt`, `test_res15.txt`) — each is a plain list of PDB IDs; supply your own to
 retrain on a different set.
 
+#### Build a dataset from raw PDB-REDO files
+
+To assemble the per-complex layout above from raw `<id>_final.cif`/`<id>_final.pdb` files
+(the PDB-REDO archive layout), use `scripts/setup_custom_dataset.py`. It splits each source
+into a protein-only `_protein_processed` file and a `_water` file (CIF by default),
+generates ESM embeddings, and writes normalized (lowercased, `_final`-stripped) split files
+to `--split_out_dir` — use those for training.
+
+```bash
+python scripts/setup_custom_dataset.py \
+    --raw_data_dir <raw_dir> \
+    --split_train <train.txt> --split_val <val.txt> --split_test <test.txt> \
+    --out_dir data/<dataset> --split_out_dir data/<dataset>_splits \
+    --embeddings_dir data/<dataset>_embeddings \
+    --skip_existing --download_missing
+```
+
+Useful flags:
+
+- `--skip_existing` — incremental re-run: complexes that already have both output files are
+  left untouched, and the embedding stage skips complexes that already have a `_chain_0.pt`.
+  (It does **not** re-fix already-written-but-corrupt files.)
+- `--download_missing` — split ids absent from `--raw_data_dir` are fetched from PDB-REDO
+  into a temp dir, processed into `--out_dir`, and the downloaded files are deleted.
+- `--out_format {cif,pdb}` — output format (default `cif`).
+- `--skip_embeddings` / `--build_cache` — skip the ESM stage, or also prebuild the PyG graph
+  cache.
+
+Run with `--help` for the full list (featurization flags, `--num_workers`, etc.).
+
 ### 2. Generate ESM-2 embeddings
+
+Skip this if you already generated embeddings via `setup_custom_dataset.py` above.
 
 ```bash
 superwater-embed --data_dir data/<dataset> --out_dir data/<dataset>_embeddings
 ```
+
+Add `--skip_existing` to embed only complexes that don't yet have a `_chain_0.pt` in the
+output dir (the ESM model is loaded lazily, so a fully-cached re-run does no model load).
 
 ### 3. Train the score (diffusion) model
 
@@ -170,8 +209,11 @@ python -m superwater.train \
 ```
 
 Checkpoints are written to `models/water_score_res15_retrain/` (`best_model.pt`,
-`best_ema_model.pt`, `last_model.pt`, `model_parameters.yml`). The dataset is preprocessed
-into a graph cache on the first run and reused afterwards.
+`best_ema_model.pt`, `last_model.pt`, `model_parameters.yml`), alongside `losses_iter.csv`
+(per-batch) and `losses_epoch.csv` (per-epoch train/val) for plotting. The dataset is
+preprocessed into a graph cache on the first run and reused afterwards; complexes that fail
+graph preprocessing are recorded in `failed_complexes.txt` in the cache directory (the only
+other trace is a missing `<name>.pt`).
 
 ### 4. Train the confidence model
 

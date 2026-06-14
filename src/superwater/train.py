@@ -1,4 +1,5 @@
 import copy
+import csv
 import math
 import os
 from functools import partial
@@ -31,55 +32,70 @@ def train(args, model, optimizer, scheduler, ema_weights, train_loader, val_load
     loss_fn = partial(loss_function, tr_weight=args.tr_weight)
 
     print("Starting training...")
-    for epoch in range(args.n_epochs):
-        if epoch % 5 == 0: print("Run name: ", args.run_name)
-        logs = {}
-        train_losses = train_epoch(model, train_loader, optimizer, device, t_to_sigma, loss_fn, ema_weights, epoch=epoch, wandb_enabled=args.wandb)
-        print("Epoch {}: Training loss {:.4f}  tr {:.4f} "
-              .format(epoch, train_losses['loss'], train_losses['tr_loss']))
+    with open(os.path.join(run_dir, 'losses_iter.csv'), 'w', newline='') as iter_f, \
+         open(os.path.join(run_dir, 'losses_epoch.csv'), 'w', newline='') as epoch_f:
+        iter_writer = csv.writer(iter_f)
+        epoch_writer = csv.writer(epoch_f)
+        iter_writer.writerow(['epoch', 'iteration', 'loss', 'tr_loss', 'tr_base_loss'])
+        epoch_writer.writerow(['epoch', 'split', 'loss', 'tr_loss', 'tr_base_loss'])
 
-        ema_weights.store(model.parameters())
-        if args.use_ema: ema_weights.copy_to(model.parameters()) # load ema parameters into model for running validation and inference
-        val_losses = test_epoch(model, val_loader, device, t_to_sigma, loss_fn, args.test_sigma_intervals)
-        print("Epoch {}: Validation loss {:.4f}  tr {:.4f} "
-              .format(epoch, val_losses['loss'], val_losses['tr_loss']))
+        def log_iter(epoch, batch_idx, loss, tr_loss, tr_base_loss):
+            iter_writer.writerow([epoch, batch_idx, loss, tr_loss, tr_base_loss])
 
-        if not args.use_ema: ema_weights.copy_to(model.parameters())
-        ema_state_dict = copy.deepcopy(model.module.state_dict() if device.type == 'cuda' else model.state_dict())
-        ema_weights.restore(model.parameters())
+        for epoch in range(args.n_epochs):
+            if epoch % 5 == 0: print("Run name: ", args.run_name)
+            logs = {}
+            train_losses = train_epoch(model, train_loader, optimizer, device, t_to_sigma, loss_fn, ema_weights, epoch=epoch, wandb_enabled=args.wandb, iter_log_fn=log_iter)
+            print("Epoch {}: Training loss {:.4f}  tr {:.4f} "
+                  .format(epoch, train_losses['loss'], train_losses['tr_loss']))
 
-        if args.wandb:
-            logs.update({'train_' + k: v for k, v in train_losses.items()})
-            logs.update({'val_' + k: v for k, v in val_losses.items()})
-            logs['current_lr'] = optimizer.param_groups[0]['lr']
-            wandb.log(logs, step=epoch + 1)
+            ema_weights.store(model.parameters())
+            if args.use_ema: ema_weights.copy_to(model.parameters()) # load ema parameters into model for running validation and inference
+            val_losses = test_epoch(model, val_loader, device, t_to_sigma, loss_fn, args.test_sigma_intervals)
+            print("Epoch {}: Validation loss {:.4f}  tr {:.4f} "
+                  .format(epoch, val_losses['loss'], val_losses['tr_loss']))
 
-        state_dict = model.module.state_dict() if device.type == 'cuda' else model.state_dict()
-        val_loss_is_finite = math.isfinite(val_losses["loss"])
-        if val_loss_is_finite and val_losses["loss"] <= best_val_loss:
-            best_val_loss = val_losses["loss"]
-            best_epoch = epoch
-            torch.save(state_dict, os.path.join(run_dir, "best_model.pt"))
-            torch.save(ema_state_dict, os.path.join(run_dir, "best_ema_model.pt"))
-        elif not val_loss_is_finite:
-            print("| WARNING: non-finite validation loss ({}); skipping best checkpoint and scheduler step".format(val_losses["loss"]))
+            if not args.use_ema: ema_weights.copy_to(model.parameters())
+            ema_state_dict = copy.deepcopy(model.module.state_dict() if device.type == 'cuda' else model.state_dict())
+            ema_weights.restore(model.parameters())
 
-        if scheduler and val_loss_is_finite:
-            if args.val_inference_freq is not None:
-                scheduler.step(best_val_inference_value)
-            else:
-                scheduler.step(val_losses["loss"])
+            epoch_writer.writerow([epoch, 'train', train_losses['loss'], train_losses['tr_loss'], train_losses['tr_base_loss']])
+            epoch_writer.writerow([epoch, 'val', val_losses['loss'], val_losses['tr_loss'], val_losses['tr_base_loss']])
+            epoch_f.flush()
+            iter_f.flush()
 
-        torch.save({
-            'epoch': epoch,
-            'model': state_dict,
-            'optimizer': optimizer.state_dict(),
-            'ema_weights': ema_weights.state_dict(),
-        }, os.path.join(run_dir, 'last_model.pt'))
+            if args.wandb:
+                logs.update({'train_' + k: v for k, v in train_losses.items()})
+                logs.update({'val_' + k: v for k, v in val_losses.items()})
+                logs['current_lr'] = optimizer.param_groups[0]['lr']
+                wandb.log(logs, step=epoch + 1)
 
-        if args.checkpoint_freq > 0 and (epoch + 1) % args.checkpoint_freq == 0:
-            torch.save(state_dict, os.path.join(run_dir, f'model_epoch{epoch + 1}.pt'))
-            torch.save(ema_state_dict, os.path.join(run_dir, f'ema_model_epoch{epoch + 1}.pt'))
+            state_dict = model.module.state_dict() if device.type == 'cuda' else model.state_dict()
+            val_loss_is_finite = math.isfinite(val_losses["loss"])
+            if val_loss_is_finite and val_losses["loss"] <= best_val_loss:
+                best_val_loss = val_losses["loss"]
+                best_epoch = epoch
+                torch.save(state_dict, os.path.join(run_dir, "best_model.pt"))
+                torch.save(ema_state_dict, os.path.join(run_dir, "best_ema_model.pt"))
+            elif not val_loss_is_finite:
+                print("| WARNING: non-finite validation loss ({}); skipping best checkpoint and scheduler step".format(val_losses["loss"]))
+
+            if scheduler and val_loss_is_finite:
+                if args.val_inference_freq is not None:
+                    scheduler.step(best_val_inference_value)
+                else:
+                    scheduler.step(val_losses["loss"])
+
+            torch.save({
+                'epoch': epoch,
+                'model': state_dict,
+                'optimizer': optimizer.state_dict(),
+                'ema_weights': ema_weights.state_dict(),
+            }, os.path.join(run_dir, 'last_model.pt'))
+
+            if args.checkpoint_freq > 0 and (epoch + 1) % args.checkpoint_freq == 0:
+                torch.save(state_dict, os.path.join(run_dir, f'model_epoch{epoch + 1}.pt'))
+                torch.save(ema_state_dict, os.path.join(run_dir, f'ema_model_epoch{epoch + 1}.pt'))
 
     print("Best Validation Loss {} on Epoch {}".format(best_val_loss, best_epoch))
 

@@ -55,7 +55,7 @@ class AverageMeter():
             return out
 
 
-def train_epoch(model, loader, optimizer, device, t_to_sigma, loss_fn, ema_weigths, epoch=0, wandb_enabled=False):
+def train_epoch(model, loader, optimizer, device, t_to_sigma, loss_fn, ema_weigths, epoch=0, wandb_enabled=False, iter_log_fn=None):
     model.train()
     meter = AverageMeter(['loss', 'tr_loss', 'tr_base_loss'])
     num_batches = len(loader)
@@ -86,6 +86,8 @@ def train_epoch(model, loader, optimizer, device, t_to_sigma, loss_fn, ema_weigt
             optimizer.step()
             ema_weigths.update(model.parameters())
             meter.add([loss.cpu().detach(), tr_loss, tr_base_loss])
+            if iter_log_fn is not None:
+                iter_log_fn(epoch, batch_idx, loss.cpu().detach().item(), tr_loss.item(), tr_base_loss.item())
 
         except RuntimeError as e:
             if 'out of memory' in str(e):

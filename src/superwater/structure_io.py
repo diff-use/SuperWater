@@ -42,6 +42,42 @@ def parse_structure(path, permissive=False, structure_id="structure"):
     return PDBParser(PERMISSIVE=permissive, QUIET=True).get_structure(structure_id, path)
 
 
+def candidate_structure_paths(directory, name, suffix):
+    """Existing structure files for ``<name><suffix>``, in CIF-first priority order.
+
+    Returns ``[<dir>/<name><suffix>.cif, .mmcif, .pdb]`` filtered to those that exist.
+    CIF is listed first because legacy PDB cannot hold 5-character ligand CCD codes
+    without column overflow; PDB is the fallback when no CIF is present (or it fails).
+    """
+    paths = []
+    for ext in (".cif", ".mmcif", ".pdb"):
+        p = os.path.join(directory, f"{name}{suffix}{ext}")
+        if os.path.exists(p):
+            paths.append(p)
+    return paths
+
+
+def parse_structure_with_fallback(directory, name, suffix, permissive=False,
+                                  structure_id="structure"):
+    """Parse the first candidate file that parses successfully (CIF preferred, PDB fallback).
+
+    Returns ``(structure, path)``. If a CIF exists but raises while parsing, the next
+    candidate (e.g. the PDB) is tried instead of failing outright. Raises
+    ``FileNotFoundError`` when no candidate exists, or re-raises the last parse error
+    when every candidate fails.
+    """
+    candidates = candidate_structure_paths(directory, name, suffix)
+    if not candidates:
+        raise FileNotFoundError(f"No structure file for {name}{suffix} in {directory}")
+    last_exc = None
+    for path in candidates:
+        try:
+            return parse_structure(path, permissive=permissive, structure_id=structure_id), path
+        except Exception as exc:  # try the next format (e.g. PDB) before giving up
+            last_exc = exc
+    raise last_exc
+
+
 def convert_txt_to_pdb(txt_file_path, output_pdb_path):
     """Write water oxygen coordinates (one ``x y z`` per line) as HETATM/HOH records.
 
