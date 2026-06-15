@@ -3,6 +3,9 @@
 # Install torch/torchvision/torchaudio first from the PyTorch CUDA 11.8 index
 # (scripts/install_uv.sh does this), then install this file. The PyG extension
 # wheels below come from the matching PyG wheel index.
+#
+# The conda environment pins e3nn==0.5.4 from conda-forge. That exact release is
+# not available on PyPI, so the uv path pins the newest PyPI 0.5.x release.
 
 --find-links https://data.pyg.org/whl/torch-2.5.0+cu118.html
 
@@ -15,7 +18,7 @@ pyyaml
 tqdm
 biopython
 rdkit
-e3nn==0.5.4
+e3nn==0.5.9
 torch-geometric==2.6.1
 torch-cluster==1.6.3
 torch-scatter==2.1.2

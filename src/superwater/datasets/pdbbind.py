@@ -170,7 +170,7 @@ class PDBBind(Dataset):
         file_list = glob.glob(pattern)
         file_list.sort(key=lambda x: int(re.search(r"_chain_(\d+)\.pt$", x).group(1)))
         
-        lm_embeddings_chains = [torch.load(filename)['representations'][33] for filename in file_list]
+        lm_embeddings_chains = [torch.load(filename, weights_only=True)['representations'][33] for filename in file_list]
         return lm_embeddings_chains
     
     def get_complex(self, name):

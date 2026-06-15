@@ -32,7 +32,7 @@ no_batch_norm: false
 ns: 24
 num_conformers: 1
 num_conv_layers: 3
-num_dataloader_workers: 4
+num_dataloader_workers: 0
 num_workers: 2
 nv: 6
 pin_memory: false

@@ -22,7 +22,11 @@ keywords = ["diffusion model", "water prediction", "protein structure", "equivar
 # `pip install -e .` only registers the package and console scripts and does not
 # attempt to re-resolve them from PyPI (where e3nn==0.5.4 and the
 # torch-cluster==1.6.3+pt25cu118 wheels are not available).
-dependencies = []
+dependencies = [
+    "numpy>=2.2.6",
+    "wand>=0.7.1",
+    "wandb>=0.27.2",
+]
 
 [project.urls]
 Homepage = "https://github.com/xiaohan-kuang/SuperWater"
