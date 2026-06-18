@@ -13,6 +13,11 @@ Contact: xiaohan.kuang@takeda.com, zhaoqian.su@takeda.com
 
 <img src="./docs/images/model_arch/superwater_model_arch_updated.png" height="380"/>
 
+> **Detailed running reference:** [`docs/RUNNING.md`](docs/RUNNING.md) documents every
+> runnable workflow end to end — setup, data prep, score training, score inference,
+> confidence setup/training, and full-pipeline inference — with the exact commands, flags,
+> and outputs.
+
 ## Installation
 
 Requires an NVIDIA GPU with CUDA 11.8 (CPU is not supported). One-command setup:
@@ -124,7 +129,9 @@ positions sampled from it. The two stages are `python -m superwater.train` and
 `python -m superwater.confidence.train` — run either with `--help` for the full argument
 list. The commands below reproduce the shipped `water_score_res15` /
 `water_confidence_res15_sigmoid` checkpoints; add `--wandb --wandb_entity <user>` to log to
-Weights & Biases.
+Weights & Biases. For score-only evaluation (`scripts/score_inference.py`,
+`benchmark_score_pr.py`) and full-pipeline evaluation over a split (`superwater-infer`),
+see [`docs/RUNNING.md`](docs/RUNNING.md).
 
 ### 1. Prepare data
 
