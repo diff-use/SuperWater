@@ -105,6 +105,9 @@ def get_model(args, device, t_to_sigma, no_parallel=False, confidence_mode=False
                             args.rmsd_classification_cutoff) + 1 if 'rmsd_classification_cutoff' in args and isinstance(
                             args.rmsd_classification_cutoff, list) else 1)
 
+    # When no_parallel is set (the default for the DDP training path) the model is
+    # returned bare and wrapped in DistributedDataParallel by the caller. The legacy
+    # DataParallel wrapper is kept only for callers that explicitly opt back in.
     if device.type == 'cuda' and not no_parallel:
         model = DataParallel(model)
     model.to(device)

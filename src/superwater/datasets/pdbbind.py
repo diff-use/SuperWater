@@ -7,8 +7,9 @@ from multiprocessing import Pool
 
 import numpy as np
 import torch
+from torch.utils.data.distributed import DistributedSampler
 from torch_geometric.data import Dataset, HeteroData
-from torch_geometric.loader import DataLoader, DataListLoader
+from torch_geometric.loader import DataLoader
 from torch_geometric.transforms import BaseTransform
 from tqdm import tqdm
 
@@ -264,9 +265,9 @@ def print_statistics(complex_graphs):
         print(f"{name[i]}: mean {np.mean(array)}, std {np.std(array)}, max {np.max(array)}")
 
 
-def construct_loader(args, t_to_sigma):
+def construct_loader(args, t_to_sigma, distributed=False, rank=0, world_size=1):
     transform = NoiseTransform(t_to_sigma=t_to_sigma, all_atom=args.all_atoms)
-    
+
     common_args = {'transform': transform, 'root': args.data_dir, 'limit_complexes': args.limit_complexes,
                    'receptor_radius': args.receptor_radius,
                    'c_alpha_max_neighbors': args.c_alpha_max_neighbors,
@@ -275,15 +276,33 @@ def construct_loader(args, t_to_sigma):
                    'num_workers': args.num_workers, 'all_atoms': args.all_atoms,
                    'atom_radius': args.atom_radius, 'atom_max_neighbors': args.atom_max_neighbors,
                    'esm_embeddings_path': args.esm_embeddings_path,
-                   'cache_scope': getattr(args, 'cache_scope', 'split')}    
+                   'cache_scope': getattr(args, 'cache_scope', 'split')}
     train_dataset = PDBBind(cache_path=args.cache_path, split_path=args.split_train, keep_original=True,
                             num_conformers=args.num_conformers, **common_args)
     val_dataset = PDBBind(cache_path=args.cache_path, split_path=args.split_val, keep_original=True, **common_args)
 
-    loader_class = DataListLoader if torch.cuda.is_available() else DataLoader
-    train_loader = loader_class(dataset=train_dataset, batch_size=args.batch_size, num_workers=args.num_dataloader_workers, shuffle=True, pin_memory=args.pin_memory)
-    val_loader = loader_class(dataset=val_dataset, batch_size=args.batch_size, num_workers=args.num_dataloader_workers, shuffle=True, pin_memory=args.pin_memory)
-    infer_loader = loader_class(dataset=val_dataset, batch_size=1, num_workers=args.num_dataloader_workers, shuffle=False, pin_memory=args.pin_memory)
+    # Always use the standard (collating) DataLoader: it yields a single batched
+    # `Batch` object, which is what both the DDP path and the model forward expect.
+    # Under DDP each rank gets a disjoint shard via DistributedSampler; drop_last on
+    # train keeps every rank's batch count identical (avoids all-reduce deadlock) and
+    # also avoids size-1 final batches that would break batch norm.
+    if distributed:
+        train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank,
+                                           shuffle=True, drop_last=True)
+        val_sampler = DistributedSampler(val_dataset, num_replicas=world_size, rank=rank,
+                                         shuffle=False, drop_last=False)
+        train_loader = DataLoader(dataset=train_dataset, batch_size=args.batch_size, sampler=train_sampler,
+                                  num_workers=args.num_dataloader_workers, pin_memory=args.pin_memory, drop_last=True)
+        val_loader = DataLoader(dataset=val_dataset, batch_size=args.batch_size, sampler=val_sampler,
+                                num_workers=args.num_dataloader_workers, pin_memory=args.pin_memory)
+    else:
+        train_loader = DataLoader(dataset=train_dataset, batch_size=args.batch_size,
+                                  num_workers=args.num_dataloader_workers, shuffle=True, pin_memory=args.pin_memory)
+        val_loader = DataLoader(dataset=val_dataset, batch_size=args.batch_size,
+                                num_workers=args.num_dataloader_workers, shuffle=True, pin_memory=args.pin_memory)
+    # Inference is run only on the main process (batch_size 1); it is never sharded.
+    infer_loader = DataLoader(dataset=val_dataset, batch_size=1, num_workers=args.num_dataloader_workers,
+                              shuffle=False, pin_memory=args.pin_memory)
 
     return train_loader, val_loader, infer_loader
 
