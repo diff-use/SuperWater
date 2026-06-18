@@ -15,17 +15,40 @@ authors = [
 ]
 keywords = ["diffusion model", "water prediction", "protein structure", "equivariant neural network"]
 
-# The heavy / compiled dependencies (PyTorch + CUDA, the PyTorch Geometric CUDA
-# wheels, e3nn, rdkit, openbabel) are installed via conda and the PyG wheel index
-# rather than from PyPI -- see environment.yml, requirements*.txt and
-# scripts/install.sh. They are intentionally NOT listed here so that
-# `pip install -e .` only registers the package and console scripts and does not
-# attempt to re-resolve them from PyPI (where e3nn==0.5.4 and the
-# torch-cluster==1.6.3+pt25cu118 wheels are not available).
+# Base install (`pip install -e .`) registers only the package, console scripts and
+# the few pure-Python deps. The heavy / compiled stack (PyTorch + CUDA, the PyTorch
+# Geometric extension wheels, e3nn, rdkit) lives in the `cu126` extra below so that
+# `uv sync --extra cu126` resolves a complete, reproducible GPU environment from the
+# pinned PyTorch / PyG indexes. Conda users install the same stack via environment.yml
+# + scripts/install.sh instead.
 dependencies = [
     "numpy>=2.2.6",
-    "wand>=0.7.1",
     "wandb>=0.27.2",
+]
+
+[project.optional-dependencies]
+# Full GPU stack for CUDA 12.6 drivers (torch 2.8 + matching PyG extension wheels).
+# torch-geometric is pinned to 2.6.1 on purpose: 2.7 made BaseTransform.forward
+# abstract, which breaks NoiseTransform (it overrides the older __call__).
+cu126 = [
+    "torch==2.8.0",
+    "torch-geometric==2.6.1",
+    "torch-cluster==1.6.3",
+    "torch-scatter==2.1.2",
+    "e3nn>=0.5.9",
+    "rdkit",
+    "fair-esm==2.0.0",
+    "biopython",
+    "scipy",
+    "pandas",
+    "scikit-learn",
+    "networkx",
+    "pyyaml",
+    "tqdm",
+    "flask>=3.0",
+]
+dev = [
+    "pytest>=8",
 ]
 
 [project.urls]
@@ -51,3 +74,23 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"
+
+# --- uv: reproducible GPU environment -------------------------------------------------
+# `uv sync --extra cu126` pulls torch from the PyTorch CUDA 12.6 index and the
+# torch-cluster / torch-scatter extension wheels from the matching PyG flat index. Both
+# are marked `explicit` so only the packages routed via [tool.uv.sources] use them.
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[[tool.uv.index]]
+name = "pyg-cu126"
+url = "https://data.pyg.org/whl/torch-2.8.0+cu126.html"
+format = "flat"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu126" }
+torch-cluster = { index = "pyg-cu126" }
+torch-scatter = { index = "pyg-cu126" }

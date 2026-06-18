@@ -3,7 +3,7 @@
 # One-shot installer for the SuperWater environment.
 #
 # Creates the `superwater` conda environment (PyTorch 2.5.1 + CUDA 11.8, e3nn 0.5.4,
-# rdkit, openbabel, ...), installs the CUDA-specific PyTorch Geometric extension
+# rdkit, ...), installs the CUDA-specific PyTorch Geometric extension
 # wheels from the PyG wheel index, and installs the `superwater` package itself
 # (editable) together with its console-script entry points.
 #

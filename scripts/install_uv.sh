@@ -1,43 +1,46 @@
 #!/usr/bin/env bash
 #
-# Create a uv-managed SuperWater environment for CUDA 11.8 training/inference.
+# Create a reproducible, uv-managed SuperWater environment from uv.lock.
+#
+# Resolves the full GPU stack (PyTorch 2.8 + CUDA 12.6, the matching PyTorch Geometric
+# extension wheels, e3nn, rdkit, fair-esm, ...) pinned in pyproject.toml / uv.lock, and
+# installs the superwater package + console scripts into ./.venv.
+#
+# Usage:
+#     bash scripts/install_uv.sh                       # runtime env
+#     EXTRAS="cu126 dev" bash scripts/install_uv.sh    # also install pytest
+#
+# Requires the `uv` launcher and an NVIDIA driver supporting CUDA 12.6. For a different
+# CUDA build, edit the [[tool.uv.index]] URLs in pyproject.toml and re-run, or use the
+# conda installer (scripts/install.sh).
 
 set -euo pipefail
-
-ENV_DIR="${ENV_DIR:-.venv}"
-PYTHON_VERSION="${PYTHON_VERSION:-3.11}"
-TORCH_INDEX="https://download.pytorch.org/whl/cu118"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${REPO_ROOT}"
 
-echo ">> [1/4] Creating uv virtualenv at ${ENV_DIR} with Python ${PYTHON_VERSION}"
-uv venv "${ENV_DIR}" --python "${PYTHON_VERSION}"
+EXTRAS="${EXTRAS:-cu126}"
+EXTRA_ARGS=()
+for e in ${EXTRAS}; do EXTRA_ARGS+=(--extra "${e}"); done
 
-echo ">> [2/4] Installing PyTorch CUDA 11.8 wheels"
-uv pip install --python "${ENV_DIR}/bin/python" \
-  --index-url "${TORCH_INDEX}" \
-  torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1
+echo ">> Syncing uv environment (.venv) with extras: ${EXTRAS}"
+uv sync "${EXTRA_ARGS[@]}"
 
-echo ">> [3/4] Installing SuperWater dependencies"
-uv pip install --python "${ENV_DIR}/bin/python" -r requirements-uv-cu118.txt
-
-echo ">> [4/4] Installing SuperWater editable package"
-uv pip install --python "${ENV_DIR}/bin/python" -e .
-
-"${ENV_DIR}/bin/python" - <<'PY'
+echo ">> Verifying the installation"
+uv run --no-sync python - <<'PY'
 import torch
 import e3nn, torch_cluster, torch_scatter, torch_geometric  # noqa: F401
-import rdkit, Bio, superwater  # noqa: F401
+import rdkit, Bio, esm, superwater  # noqa: F401
 print(f"torch {torch.__version__} | CUDA available: {torch.cuda.is_available()}")
+print(f"torch_geometric {torch_geometric.__version__}  (pinned 2.6.1)")
 print("SuperWater uv environment imports successfully.")
 PY
 
 cat <<EOF
 
-Done. Activate with:
+Done. Run commands through the locked env, e.g.:
 
-  source ${ENV_DIR}/bin/activate
+  uv run superwater-predict --config examples/configs/predict_5srf.yaml
 
 EOF

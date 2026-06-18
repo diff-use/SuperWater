@@ -82,7 +82,10 @@ def embed_dataset(data_dir, out_dir, device, truncation=TRUNCATION_SEQ_LENGTH,
     ``out_dir`` are left untouched, so a re-run only embeds new/missing complexes.
     """
     from superwater.structure_io import candidate_structure_paths
-    names = sorted(d for d in os.listdir(data_dir) if os.path.isdir(os.path.join(data_dir, d)))
+    # "logs" is the prep stage's own output subdir, not a complex; skip it (otherwise it
+    # gets reported as a spurious "_protein_processed not found" embedding skip).
+    names = sorted(d for d in os.listdir(data_dir)
+                   if d != "logs" and os.path.isdir(os.path.join(data_dir, d)))
     model = alphabet = None  # loaded lazily so a fully-skipped re-run does no model load
     skipped = []
     n_exists = 0

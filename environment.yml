@@ -4,7 +4,7 @@
 # impossible to install from PyPI:
 #   * PyTorch 2.5.1 built against CUDA 11.8        (pytorch / nvidia channels)
 #   * e3nn 0.5.4                                   (conda-forge -- no longer on PyPI)
-#   * rdkit, openbabel, biopython, numpy, scipy …  (conda-forge)
+#   * rdkit, biopython, numpy, scipy …             (conda-forge)
 # The pure-Python packages are pulled in from requirements.txt (pip section below).
 #
 # The compiled PyTorch Geometric extension wheels (torch-cluster / torch-scatter /
@@ -44,7 +44,6 @@ dependencies:
   # --- structural biology / cheminformatics ---
   - biopython
   - rdkit
-  - openbabel
   # --- pure-Python deps from PyPI ---
   - pip:
       - -r requirements.txt

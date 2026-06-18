@@ -20,14 +20,41 @@ Contact: xiaohan.kuang@takeda.com, zhaoqian.su@takeda.com
 
 ## Installation
 
-Requires an NVIDIA GPU with CUDA 11.8 (CPU is not supported). One-command setup:
+Requires an NVIDIA GPU (CPU is not supported).
+
+### Recommended: uv (reproducible, locked)
+
+For a CUDA 12.6 driver, one command resolves the full stack from `uv.lock` (PyTorch
+2.8 + the matching PyTorch Geometric extension wheels, e3nn, rdkit, fair-esm, …) and
+installs `superwater` itself:
+
+```bash
+uv sync --extra cu126          # add --extra dev for pytest
+```
+
+Then run any command through the locked environment, e.g.:
+
+```bash
+uv run superwater-predict --config examples/configs/predict_5srf.yaml
+uv run python -m pytest          # add --extra dev first
+```
+
+The PyTorch / PyG indexes and pins live in `pyproject.toml` (`[tool.uv]`). `torch-geometric`
+is pinned to **2.6.1** on purpose — 2.7 made `BaseTransform.forward` abstract, which breaks
+the dataset's `NoiseTransform`.
+
+> Different CUDA version? Edit the two `[[tool.uv.index]]` URLs in `pyproject.toml`
+> (`download.pytorch.org/whl/<cuXXX>` and `data.pyg.org/whl/torch-<ver>+<cuXXX>.html`) to a
+> matching pair, then re-run `uv lock && uv sync --extra cu126`. Or use the conda path.
+
+### Alternative: conda (CUDA 11.8)
 
 ```bash
 bash scripts/install.sh
 conda activate superwater
 ```
 
-This creates the `superwater` conda env (PyTorch 2.5.1+cu118, e3nn, rdkit, openbabel),
+This creates the `superwater` conda env (PyTorch 2.5.1+cu118, e3nn, rdkit),
 installs the PyTorch Geometric CUDA wheels, and runs `pip install -e .`. Equivalent manual
 steps:
 
@@ -38,7 +65,7 @@ pip install -r requirements-pyg-cu118.txt
 pip install -e .
 ```
 
-Check the GPU with `python scripts/check_gpu.py`.
+Check the GPU with `python scripts/check_gpu.py` (or `uv run python scripts/check_gpu.py`).
 
 ## Quick start
 
@@ -180,6 +207,18 @@ Useful flags:
 - `--out_format {cif,pdb}` — output format (default `cif`).
 - `--skip_embeddings` / `--build_cache` — skip the ESM stage, or also prebuild the PyG graph
   cache.
+
+**Per-water quality filters** (ON by default) drop unreliable crystallographic waters before
+they become training targets — a water is removed if it fails any enabled filter:
+
+- `--max_protein_dist` (5.0 Å) — distance from the nearest protein atom; `--no_filter_by_distance`.
+- `--min_edia` (0.4) — minimum EDIAm electron-density score, read from the PDB-REDO
+  `<id>_final.json` sidecar (no-op when absent); `--no_filter_by_edia`.
+- `--max_bfactor_zscore` (1.5) — per-structure water B-factor z-score; `--no_filter_by_bfactor`.
+
+The `logs/prepared.tsv` `waters_kept/total` column reports how many survived per complex.
+Because filtering bakes into the written `_water` files, **rebuild any existing `data/cache/`
+graphs** after re-running prep with different filter settings.
 
 Run with `--help` for the full list (featurization flags, `--num_workers`, etc.).
 

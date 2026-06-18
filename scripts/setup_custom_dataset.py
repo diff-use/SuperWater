@@ -22,11 +22,18 @@ from functools import partial
 from multiprocessing import Pool
 from pathlib import Path
 
+import numpy as np
 from Bio.PDB import PDBIO
 from Bio.PDB.PDBExceptions import PDBConstructionWarning
 from Bio.PDB.PDBIO import Select
 from tqdm import tqdm
 
+from superwater.datasets.water_quality import (
+    compute_normalized_bfactors,
+    filter_waters_by_quality,
+    load_edia_for_pdb,
+    normalize_ins_code,
+)
 from superwater.structure_io import parse_structure, candidate_structure_paths
 
 
@@ -56,6 +63,7 @@ def parse_args(argv=None):
     p.add_argument("--logs_dir", default=None)
     p.add_argument("--num_workers", type=int, default=8)
     p.add_argument("--min_water_dist", type=float, default=1.9)
+    add_water_filter_args(p)
     p.add_argument("--out_format", choices=["cif", "pdb"], default="cif",
                    help="Format for the written _protein_processed and _water files. "
                         "CIF is the default because legacy PDB cannot hold 5-character "
@@ -89,6 +97,36 @@ def parse_args(argv=None):
     p.add_argument("--atom_max_neighbors", type=int, default=8)
     p.add_argument("--limit_complexes", type=int, default=0)
     return p.parse_args(argv)
+
+
+def add_water_filter_args(p: argparse.ArgumentParser) -> None:
+    """Per-water quality filters (ported from WaterFlow). All ON by default; a water is
+    dropped if it fails any enabled filter. Disable individually with --no_filter_by_*."""
+    p.add_argument("--max_protein_dist", type=float, default=5.0,
+                   help="Drop waters farther than this (A) from the nearest protein atom.")
+    p.add_argument("--min_edia", type=float, default=0.4,
+                   help="Drop waters with EDIAm below this (from <id>_final.json; "
+                        "no-op when the sidecar is absent).")
+    p.add_argument("--max_bfactor_zscore", type=float, default=1.5,
+                   help="Drop waters whose per-structure B-factor z-score exceeds this.")
+    p.add_argument("--filter_by_distance", action="store_true", default=True)
+    p.add_argument("--no_filter_by_distance", action="store_false", dest="filter_by_distance")
+    p.add_argument("--filter_by_edia", action="store_true", default=True)
+    p.add_argument("--no_filter_by_edia", action="store_false", dest="filter_by_edia")
+    p.add_argument("--filter_by_bfactor", action="store_true", default=True)
+    p.add_argument("--no_filter_by_bfactor", action="store_false", dest="filter_by_bfactor")
+
+
+def water_filter_cfg(args) -> dict:
+    """Build the filter-config dict consumed by ``quality_filtered_coords``."""
+    return {
+        "filter_by_distance": args.filter_by_distance,
+        "filter_by_edia": args.filter_by_edia,
+        "filter_by_bfactor": args.filter_by_bfactor,
+        "max_protein_dist": args.max_protein_dist,
+        "min_edia": args.min_edia,
+        "max_bfactor_zscore": args.max_bfactor_zscore,
+    }
 
 
 def normalize_id(raw: str) -> str:
@@ -172,7 +210,8 @@ def download_entry(pdb_id: str, dest_root: Path) -> Path | None:
     pdb_id = pdb_id.lower()
     entry_dir = Path(dest_root) / pdb_id
     entry_dir.mkdir(parents=True, exist_ok=True)
-    wanted = {f"{pdb_id}_final.cif", f"{pdb_id}_final.pdb"}
+    # The _final.json sidecar carries EDIA scores used by the per-water quality filter.
+    wanted = {f"{pdb_id}_final.cif", f"{pdb_id}_final.pdb", f"{pdb_id}_final.json"}
     url = PDB_REDO_ZIP_URL.format(pdb_id=pdb_id)
 
     tmp_zip = None
@@ -202,7 +241,8 @@ def download_entry(pdb_id: str, dest_root: Path) -> Path | None:
         if tmp_zip is not None:
             tmp_zip.unlink(missing_ok=True)
 
-    if not found:
+    # Require at least one structure file; a lone JSON sidecar is not usable on its own.
+    if not (found & {f"{pdb_id}_final.cif", f"{pdb_id}_final.pdb"}):
         shutil.rmtree(entry_dir, ignore_errors=True)
         return None
     return entry_dir
@@ -223,8 +263,21 @@ def has_protein_residue(structure) -> bool:
     return False
 
 
-def extract_water_coords(structure, min_water_dist: float) -> list[tuple[float, float, float]]:
-    coords = []
+@dataclass(frozen=True)
+class WaterRecord:
+    coord: tuple[float, float, float]
+    key: tuple[str, int, str]  # (chain_id, res_id, ins_code)
+    b_factor: float
+
+
+def extract_waters(structure, min_water_dist: float) -> list[WaterRecord]:
+    """One oxygen per water residue, deduplicated by ``min_water_dist``.
+
+    Each kept water carries its residue key ``(chain_id, res_id, ins_code)`` and raw
+    B-factor so downstream quality filters (EDIA / B-factor z-score) can be applied
+    before the stripped ``_water`` file (which loses both) is written.
+    """
+    records: list[WaterRecord] = []
     min_d2 = min_water_dist * min_water_dist
     model = next(structure.get_models())
     for residue in model.get_residues():
@@ -236,11 +289,22 @@ def extract_water_coords(structure, min_water_dist: float) -> list[tuple[float, 
             if atom_name != "O" and element != "O":
                 continue
             x, y, z = (float(v) for v in atom.coord)
-            if any((x - cx) ** 2 + (y - cy) ** 2 + (z - cz) ** 2 < min_d2 for cx, cy, cz in coords):
+            if any((x - cx) ** 2 + (y - cy) ** 2 + (z - cz) ** 2 < min_d2
+                   for cx, cy, cz in (r.coord for r in records)):
                 continue
-            coords.append((x, y, z))
+            chain_id = str(residue.get_parent().id)
+            key = (chain_id, int(residue.id[1]), normalize_ins_code(residue.id[2]))
+            records.append(WaterRecord((x, y, z), key, float(atom.get_bfactor())))
             break
-    return coords
+    return records
+
+
+def extract_protein_coords(structure) -> list[tuple[float, float, float]]:
+    """All non-water atom coordinates (used for the distance-to-protein filter)."""
+    model = next(structure.get_models())
+    return [tuple(float(v) for v in atom.coord)
+            for residue in model.get_residues() if not is_water_residue(residue)
+            for atom in residue]
 
 
 def write_water_pdb(coords: list[tuple[float, float, float]], path: Path) -> None:
@@ -301,9 +365,45 @@ def write_water(coords: list[tuple[float, float, float]], path: Path, fmt: str) 
         write_water_pdb(coords, path)
 
 
+def quality_filtered_coords(records, structure, source: Path, filter_cfg: dict, cache_key: str):
+    """Apply the enabled per-water quality filters and return surviving coordinates.
+
+    ``filter_cfg`` carries the thresholds and the three ``filter_by_*`` toggles. EDIA is
+    read from the ``<source_stem>.json`` sidecar; when any input is unavailable that
+    filter degrades to a no-op (all waters pass it).
+    """
+    if not any((filter_cfg["filter_by_distance"], filter_cfg["filter_by_edia"],
+                filter_cfg["filter_by_bfactor"])):
+        return [r.coord for r in records]
+
+    water_coords = np.array([r.coord for r in records], dtype=float)
+    water_keys = [r.key for r in records]
+
+    protein_coords = None
+    if filter_cfg["filter_by_distance"]:
+        protein_coords = np.array(extract_protein_coords(structure), dtype=float)
+
+    edia_lookup = None
+    if filter_cfg["filter_by_edia"]:
+        edia_lookup = load_edia_for_pdb(source.with_suffix(".json"))
+
+    bfactor_lookup = None
+    if filter_cfg["filter_by_bfactor"]:
+        bfactor_lookup = compute_normalized_bfactors([(r.key, r.b_factor) for r in records])
+
+    keep_mask = filter_waters_by_quality(
+        water_coords, water_keys, protein_coords, edia_lookup, bfactor_lookup,
+        max_protein_dist=filter_cfg["max_protein_dist"],
+        min_edia=filter_cfg["min_edia"],
+        max_bfactor_zscore=filter_cfg["max_bfactor_zscore"],
+        cache_key=cache_key,
+    )
+    return [r.coord for r, keep in zip(records, keep_mask) if keep]
+
+
 def process_one(job):
     raw_root, out_dir, entry, min_water_dist, out_format, skip_existing, \
-        download_missing, tmp_root = job
+        download_missing, tmp_root, filter_cfg = job
     raw_root = Path(raw_root)
     out_dir = Path(out_dir)
     dest = out_dir / entry.norm
@@ -338,9 +438,13 @@ def process_one(job):
         if not has_protein_residue(structure):
             return entry.norm, "no_protein", ""
 
-        waters = extract_water_coords(structure, min_water_dist)
-        if not waters:
+        records = extract_waters(structure, min_water_dist)
+        if not records:
             return entry.norm, "no_waters", ""
+
+        waters = quality_filtered_coords(records, structure, source, filter_cfg, entry.norm)
+        if not waters:
+            return entry.norm, "no_waters_after_filter", ""
 
         dest.mkdir(parents=True, exist_ok=True)
         protein_path = dest / f"{entry.norm}_protein_processed.{out_format}"
@@ -353,7 +457,8 @@ def process_one(job):
             return entry.norm, "write_error", str(exc)
         write_water(waters, water_path, out_format)
 
-        meta = f"{source}\t{len(waters)}\t{protein_path}\t{water_path}"
+        # waters column is "<kept>/<pre-filter>" so the log shows how many were dropped.
+        meta = f"{source}\t{len(waters)}/{len(records)}\t{protein_path}\t{water_path}"
         return entry.norm, ("downloaded" if downloaded_dir is not None else "ok"), meta
     finally:
         if downloaded_dir is not None:
@@ -399,6 +504,13 @@ def prebuild_cache(args, split_paths: dict[str, Path], embeddings_dir: Path) -> 
 
 def main(argv=None):
     args = parse_args(argv)
+    if args.out_format == "pdb":
+        # Legacy PDB truncates/overflows 5-character ligand CCD codes (e.g. A1ADA),
+        # silently corrupting the protein file and any embedding derived from it. CIF
+        # round-trips them; prefer it unless you are certain none of your structures use
+        # 5-char codes. (Run scripts/audit_dataset.py later to spot any damage.)
+        print("WARNING: --out_format pdb can corrupt structures with 5-character CCD "
+              "codes; CIF (the default) is strongly recommended.")
     raw_root = Path(args.raw_data_dir).expanduser().resolve()
     out_dir = Path(args.out_dir).expanduser().resolve()
     split_out_dir = Path(args.split_out_dir).expanduser().resolve()
@@ -418,9 +530,10 @@ def main(argv=None):
         tmp_root = Path(tempfile.mkdtemp(prefix="superwater_dl_",
                                          dir=args.tmp_dir if args.tmp_dir else None))
 
+    filter_cfg = water_filter_cfg(args)
     jobs = [(str(raw_root), str(out_dir), entry, args.min_water_dist, args.out_format,
              args.skip_existing, args.download_missing,
-             str(tmp_root) if tmp_root is not None else None)
+             str(tmp_root) if tmp_root is not None else None, filter_cfg)
             for entry in all_entries]
     prepared, skipped, metadata = set(), defaultdict(list), {}
     n_exists = 0
@@ -456,7 +569,7 @@ def main(argv=None):
     for reason, ids in sorted(skipped.items()):
         write_lines(logs_dir / f"skipped_{reason}.txt", sorted(ids))
     with open(logs_dir / "prepared.tsv", "w") as f:
-        f.write("id\tsource\twaters\tprotein\twater\n")
+        f.write("id\tsource\twaters_kept/total\tprotein\twater\n")
         for cid in sorted(metadata):
             f.write(f"{cid}\t{metadata[cid]}\n")
 

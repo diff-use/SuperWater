@@ -3,7 +3,7 @@
 # This file does NOT contain:
 #   * torch / torchvision / torchaudio / pytorch-cuda  -> installed via conda (environment.yml)
 #   * e3nn                                             -> installed via conda-forge (environment.yml)
-#   * rdkit / openbabel / biopython / numpy / scipy …  -> installed via conda (environment.yml)
+#   * rdkit / biopython / numpy / scipy …              -> installed via conda (environment.yml)
 #   * torch-cluster / torch-scatter / torch-sparse /
 #     torch-spline-conv                                -> see requirements-pyg-cu118.txt (PyG wheel index)
 #

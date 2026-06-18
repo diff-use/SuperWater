@@ -6,7 +6,6 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 EXAMPLE_WATER_PDB = REPO_ROOT / "examples" / "data" / "5SRF" / "5SRF_water.pdb"
-EXAMPLE_WATER_MOL2 = REPO_ROOT / "examples" / "data" / "5SRF" / "5SRF_water.mol2"
 
 
 def test_convert_txt_to_pdb(tmp_path):
@@ -33,19 +32,20 @@ def test_find_real_water_pos_pdb():
     assert len(pos) > 0
 
 
-@pytest.mark.skipif(not EXAMPLE_WATER_MOL2.exists(), reason="bundled example data missing")
-def test_find_real_water_pos_mol2():
-    from superwater.utils.find_water_pos import find_real_water_pos
-
-    pos = find_real_water_pos(str(EXAMPLE_WATER_MOL2))
-    assert pos.ndim == 2 and pos.shape[1] == 3
-    assert len(pos) > 0
-
-
 def test_find_real_water_pos_rejects_unknown_extension(tmp_path):
     from superwater.utils.find_water_pos import find_real_water_pos
 
     bad = tmp_path / "water.xyz"
     bad.write_text("nonsense")
+    with pytest.raises(ValueError):
+        find_real_water_pos(str(bad))
+
+
+def test_find_real_water_pos_rejects_mol2(tmp_path):
+    # The legacy OpenBabel-backed .mol2 path was removed; mol2 is no longer accepted.
+    from superwater.utils.find_water_pos import find_real_water_pos
+
+    bad = tmp_path / "water.mol2"
+    bad.write_text("@<TRIPOS>MOLECULE\n")
     with pytest.raises(ValueError):
         find_real_water_pos(str(bad))

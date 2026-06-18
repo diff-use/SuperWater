@@ -49,8 +49,8 @@ bash scripts/install.sh
 conda activate superwater
 ```
 
-This creates the `superwater` conda env (PyTorch 2.5.1 + CUDA 11.8, e3nn 0.5.4, rdkit,
-openbabel), installs the PyTorch Geometric CUDA extension wheels from the PyG wheel index
+This creates the `superwater` conda env (PyTorch 2.5.1 + CUDA 11.8, e3nn 0.5.4, rdkit),
+installs the PyTorch Geometric CUDA extension wheels from the PyG wheel index
 (`torch-2.5.0+cu118`), and runs `pip install -e .` so the `superwater-*` console scripts
 are registered. Equivalent manual steps:
 
@@ -61,16 +61,19 @@ pip install -r requirements-pyg-cu118.txt
 pip install -e .
 ```
 
-### 1.2 uv (alternative)
+### 1.2 uv (recommended, reproducible)
 
 ```bash
-bash scripts/install_uv.sh          # creates .venv (Python 3.11, torch 2.5.1+cu118)
-.venv/bin/python -m superwater.predict --config examples/configs/predict_5srf.yaml
+uv sync --extra cu126               # or: bash scripts/install_uv.sh
+uv run superwater-predict --config examples/configs/predict_5srf.yaml
 ```
 
-`install_uv.sh` installs the CUDA 11.8 torch wheels, then
-`requirements-uv-cu118.txt`, then the package. Use `.venv/bin/python` (or activate the
-venv) for all subsequent commands.
+`uv sync --extra cu126` resolves the full GPU stack from `uv.lock` (PyTorch 2.8 + CUDA
+12.6 and the matching PyG extension wheels, pinned in `pyproject.toml`'s `[tool.uv]`),
+including `torch-geometric==2.6.1`, and installs the package into `./.venv`. Prefix
+subsequent commands with `uv run` (or activate `.venv`). Add `--extra dev` for pytest.
+For a different CUDA build, edit the two `[[tool.uv.index]]` URLs in `pyproject.toml` and
+re-run `uv lock && uv sync --extra cu126`, or use the conda installer above.
 
 ### 1.3 Verify the GPU
 
@@ -182,12 +185,23 @@ superwater-embed --data_dir data/<dataset> --out_dir data/<dataset>_embeddings
 Output: one `<name>_chain_<i>.pt` per chain. Point training/inference `--esm_embeddings_path`
 at this directory.
 
-### 2.4 Repairing a corrupt dataset
+### 2.4 Auditing a dataset
 
-`scripts/fix_failed_entries.py` re-derives `_protein_processed.cif`/`_water.cif` from raw
-`_final.cif` for complexes whose PDB write was corrupted by 5-character CCD codes, and
-regenerates only their embeddings. Run it, then re-run training (dataset-scope caching
-builds only the now-missing graphs). See the script's docstring for the exact invocation.
+`setup_custom_dataset.py` writes CIF by default, which round-trips 5-character ligand CCD
+codes (e.g. `A1ADA`) that legacy PDB silently corrupts — so a CIF build needs no separate
+repair step. To health-check an existing dataset, use the read-only auditor:
+
+```bash
+python scripts/audit_dataset.py \
+    --data_dir data/<dataset> --embeddings_dir data/<dataset>_embeddings
+```
+
+It writes `<data_dir>/logs/audit_report.tsv` (override with `--report` for read-only dirs)
+and exits non-zero if any complex is missing/unparseable, has zero waters, or lacks an
+embedding. To repair flagged complexes, delete their processed files and re-run prep — the
+auditor's `--delete_broken` does the deletion in place, then `setup_custom_dataset.py
+--skip_existing` re-derives them as CIF and re-embeds (dataset-scope caching rebuilds only
+the now-missing graphs).
 
 ---
 
@@ -441,7 +455,7 @@ Point one structure folder in, get clustered waters per structure out. The confi
 | `CUDA is not available` | No supported GPU/driver; nothing runs. Check `python scripts/check_gpu.py`. |
 | CUDA out of memory | Lower `--water_ratio`, `--batch_size`, and/or `--sampling_batch_size`. OOM on a single complex is caught and the complex is skipped. |
 | First run very slow | Expected: the PyG graph cache (and, for confidence, the sampled-position cache) is built once and reused. Use `--resume`/`--skip_existing` to restart safely. |
-| Corrupt protein/embedding files | Rebuild affected complexes with `scripts/fix_failed_entries.py`, then re-run (dataset-scope caching builds only the missing graphs). |
+| Corrupt protein/embedding files | Find them with `scripts/audit_dataset.py` (use `--delete_broken`), then re-run `setup_custom_dataset.py --skip_existing` to re-derive them as CIF (dataset-scope caching builds only the missing graphs). |
 | Failed complexes during training | See `failed_complexes.txt` in the cache directory. |
 | ESM download every run | First run only; the ~2.5 GB ESM-2 model is cached under `~/.cache/torch`. |
 </content>
