@@ -251,7 +251,8 @@ python -m superwater.train \
     --lr 1e-3 --batch_size 8 --n_epochs 300 \
     --scheduler plateau --scheduler_patience 30 --dropout 0.1 \
     --use_ema --cudnn_benchmark --test_sigma_intervals \
-    --num_workers 10 --num_dataloader_workers 10
+    --num_workers 10 --num_dataloader_workers 10 \
+    --cache_scope dataset
 ```
 
 Checkpoints are written to `models/water_score_res15_retrain/` (`best_model.pt`,
@@ -261,14 +262,12 @@ preprocessed into a graph cache on the first run and reused afterwards; complexe
 graph preprocessing are recorded in `failed_complexes.txt` in the cache directory (the only
 other trace is a missing `<name>.pt`).
 
-**Multi-GPU:** swap `python` for `torchrun --standalone --nnodes=1 --nproc_per_node=<N>`
-(same args) to train on `N` GPUs with DDP. Effective batch size becomes
-`--batch_size × N`, so scale `--lr` accordingly.
-
-**Resume:** add `--restart_dir models/water_score_res15_retrain` to continue from the exact
-epoch a run stopped at (it restores model/optimizer/scheduler/EMA from `last_model.pt`).
-`--n_epochs` is the absolute target — set `--n_epochs 300` to take a run that stopped at
-epoch 100 up to 300 total. See [docs/RUNNING.md §3.4–3.5](docs/RUNNING.md) for details.
+Always pass `--cache_scope dataset`. It keys the graph cache by the dataset directory (one
+shared `.pt` per complex) instead of by the split-file name, so per-complex graphs are
+reused across *any* split that points at the same `--data_dir` — re-splitting train/val/test
+never triggers a rebuild, and it builds only the complexes it has not seen yet. The legacy
+`split` scope (the historical default) keys by split-file basename and silently drops
+complexes that are not already cached under that exact basename.
 
 ### 4. Train the confidence model
 
@@ -291,7 +290,8 @@ python -m superwater.confidence.train \
     --inference_steps 20 --water_ratio 15 \
     --lr 1e-3 --batch_size 8 --n_epochs 50 \
     --running_mode train --mad_prediction \
-    --cache_creation_id 1 --cache_ids_to_combine 1
+    --cache_creation_id 1 --cache_ids_to_combine 1 \
+    --cache_scope dataset
 ```
 
 The first run is slow: it samples and caches positions for every training complex (under

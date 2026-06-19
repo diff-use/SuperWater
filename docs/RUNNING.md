@@ -153,7 +153,9 @@ Useful flags:
 - `--out_format {cif,pdb}` — output structure format (default `cif`).
 - `--skip_embeddings` — skip the ESM stage (run `superwater-embed` later instead).
 - `--build_cache` / `--cache_path` / `--cache_scope {dataset,split}` — also prebuild the
-  PyG graph cache (`--cache_scope dataset` shares per-complex graphs across split files).
+  PyG graph cache. Always use `--cache_scope dataset`: it shares one per-complex graph across
+  all split files, so the same cache is reused by every later training/inference run on this
+  `--data_dir`.
 - Featurization flags (`--all_atoms`/`--no_all_atoms`, `--remove_hs`/`--keep_hs`,
   `--receptor_radius`, `--c_alpha_max_neighbors`, …) must match the model you'll train.
 
@@ -226,18 +228,25 @@ python -m superwater.train \
     --lr 1e-3 --batch_size 8 --n_epochs 300 \
     --scheduler plateau --scheduler_patience 30 --dropout 0.1 \
     --use_ema --cudnn_benchmark --test_sigma_intervals \
-    --num_workers 10 --num_dataloader_workers 10
+    --num_workers 10 --num_dataloader_workers 10 \
+    --cache_scope dataset
 ```
 
 The command above reproduces the shipped `models/water_score_res15` checkpoint. Add
 `--wandb --wandb_entity <user>` to log to Weights & Biases.
 
+> **Always pass `--cache_scope dataset`.** It keys the graph cache by the dataset directory
+> (one shared `.pt` per complex) rather than by the split-file basename, so per-complex
+> graphs are reused across *any* split pointing at the same `--data_dir`, and only
+> not-yet-seen complexes are built. The legacy `split` scope keys by split-file basename and,
+> once a split's `done.txt` exists, silently drops any complex not already cached under that
+> exact basename — so re-splitting (or reusing a cache built from a different split) loses
+> complexes. Use `dataset` for every training/confidence/inference run.
+
 **Outputs** (`models/<run_name>/`):
 
 - `best_model.pt`, `best_ema_model.pt`, `last_model.pt` — checkpoints (EMA only with
-  `--use_ema`). `last_model.pt` is rewritten every epoch and holds the full resume state —
-  epoch number, optimizer, LR scheduler, EMA weights, and best-val tracking — for
-  `--restart_dir` (see [Resuming a run](#35-resuming-a-run)).
+  `--use_ema`). `last_model.pt` also holds optimizer/EMA state for `--restart_dir`.
 - `model_parameters.yml` — full arg snapshot; downstream stages read graph/arch params from
   here, so the dataset only needs to be specified once.
 - `losses_iter.csv` (per batch) and `losses_epoch.csv` (per-epoch train/val) — plot with
@@ -248,7 +257,7 @@ The command above reproduces the shipped `models/water_score_res15` checkpoint. 
 | Flag | Meaning |
 |------|---------|
 | `--cache_path` | PyG graph cache dir (default `data/cache`); built on first run, reused after. |
-| `--cache_scope {split,dataset}` | `dataset` reuses per-complex graphs across split files. |
+| `--cache_scope {split,dataset}` | **Always use `dataset`.** Keys the cache by `--data_dir` and shares one `.pt` per complex across all splits, building only unseen complexes. `split` (legacy default) keys by split-file basename and drops complexes missing from that basename's cache. |
 | `--receptor_radius`, `--c_alpha_max_neighbors`, `--atom_radius`, `--atom_max_neighbors`, `--all_atoms`, `--remove_hs` | Graph construction — must be reused consistently downstream. |
 | `--ns`, `--nv`, `--num_conv_layers`, `--*_embed_dim`, `--dropout` | Network architecture. |
 | `--tr_sigma_min`, `--tr_sigma_max`, `--scale_by_sigma` | Diffusion noise schedule. |
@@ -258,48 +267,6 @@ The command above reproduces the shipped `models/water_score_res15` checkpoint. 
 
 Complexes that fail graph preprocessing are recorded in `failed_complexes.txt` inside the
 cache directory; the only other trace is a missing `<name>.pt`.
-
-### 3.4 Multi-GPU training (DDP)
-
-Training supports single-node, multi-GPU `DistributedDataParallel`. Launch with `torchrun`
-instead of `python` and the same `superwater.train` args — no code flags change:
-
-```bash
-torchrun --standalone --nnodes=1 --nproc_per_node=4 -m superwater.train \
-    --run_name water_score_res15_ddp \
-    ...same args as the single-GPU command above...
-```
-
-- `--nproc_per_node` = number of GPUs (one process per GPU). `superwater.train` reads
-  `WORLD_SIZE`/`RANK`/`LOCAL_RANK` from `torchrun`; with `WORLD_SIZE=1` (plain `python -m
-  superwater.train`) it transparently falls back to single-GPU/CPU, so the same entry point
-  serves both.
-- Backend is **NCCL**. The dataset is sharded across ranks by a `DistributedSampler`, so the
-  **effective batch size is `--batch_size × nproc_per_node`** — scale `--lr` accordingly.
-- Each rank offsets its seed by `rank` so the diffusion noise differs per shard; validation
-  loss is all-reduced so every rank agrees on best-model and scheduler decisions.
-- Only **rank 0** writes checkpoints, CSV logs, and W&B — no duplicate output.
-
-### 3.5 Resuming a run
-
-`--restart_dir <models/run_name>` resumes from that run's `last_model.pt`, restoring model,
-optimizer, LR scheduler, EMA, and best-val tracking, then **continuing from the exact epoch
-the run stopped at** (e.g. killed after epoch 99 → resumes at epoch 100).
-
-`--n_epochs` is the **absolute target**, not a count of additional epochs: to extend a run
-that stopped at epoch 100 to 300 total, resume with `--n_epochs 300` (runs epochs 100–299).
-If `--n_epochs` ≤ the completed epoch, no epochs run and a warning is printed — raise it to
-continue. Loss CSVs are appended (not truncated) on resume, preserving the full history.
-
-```bash
-# extend the run above from wherever it stopped, up to 300 epochs total
-python -m superwater.train --restart_dir models/water_score_res15_retrain \
-    --n_epochs 300 ...same args as the original command...
-```
-
-Resume works the same under `torchrun` for DDP runs. Checkpoints written before this
-resume support existed (lacking scheduler/best-val state) still load — those fields fall
-back to defaults. `--restart_lr <lr>` overrides the optimizer LR on resume.
 
 ---
 
@@ -389,7 +356,8 @@ python -m superwater.confidence.train \
     --inference_steps 20 --water_ratio 15 \
     --lr 1e-3 --batch_size 8 --n_epochs 50 \
     --running_mode train --mad_prediction \
-    --cache_creation_id 1 --cache_ids_to_combine 1
+    --cache_creation_id 1 --cache_ids_to_combine 1 \
+    --cache_scope dataset
 ```
 
 **The cache-building (setup) stage.** The first run is slow: it samples and caches water
@@ -444,7 +412,7 @@ superwater-infer \
     --data_dir data/<dataset> \
     --esm_embeddings_path data/<dataset>_embeddings \
     --split_test examples/data/splits/test_res15.txt \
-    --cache_path data/cache_infer \
+    --cache_path data/cache_infer --cache_scope dataset \
     --water_ratio 10 --inference_steps 20 --cap 0.1 \
     --save_pos --output_format pdb
 ```

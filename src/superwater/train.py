@@ -199,8 +199,15 @@ def main_function():
 
     # construct loader
     t_to_sigma = partial(t_to_sigma_compl, args=args)
+    # Build the graph cache on rank 0 first: non-main ranks wait at the barrier while rank 0
+    # preprocesses, then they only read the cache. Without this, every rank writes the same
+    # .pt files concurrently (corruption + redundant work) on a fresh/partial cache.
+    if distributed and not is_main:
+        dist.barrier()
     train_loader, val_loader, infer_loader = construct_loader(
         args, t_to_sigma, distributed=distributed, rank=rank, world_size=world_size)
+    if distributed and is_main:
+        dist.barrier()
 
     # Build the bare model, optionally restore weights, then wrap in DDP. Wrapping after the
     # restore means DDP broadcasts the (loaded) rank-0 weights to all ranks at construction.

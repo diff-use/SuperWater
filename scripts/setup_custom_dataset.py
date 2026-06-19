@@ -34,6 +34,12 @@ from superwater.datasets.water_quality import (
     load_edia_for_pdb,
     normalize_ins_code,
 )
+from superwater.datasets.structure_quality import (
+    check_chain_interactions,
+    check_com_distance,
+    check_water_clashes,
+    check_water_residue_ratio,
+)
 from superwater.structure_io import parse_structure, candidate_structure_paths
 
 
@@ -64,6 +70,7 @@ def parse_args(argv=None):
     p.add_argument("--num_workers", type=int, default=8)
     p.add_argument("--min_water_dist", type=float, default=1.9)
     add_water_filter_args(p)
+    add_structure_filter_args(p)
     p.add_argument("--out_format", choices=["cif", "pdb"], default="cif",
                    help="Format for the written _protein_processed and _water files. "
                         "CIF is the default because legacy PDB cannot hold 5-character "
@@ -126,6 +133,46 @@ def water_filter_cfg(args) -> dict:
         "max_protein_dist": args.max_protein_dist,
         "min_edia": args.min_edia,
         "max_bfactor_zscore": args.max_bfactor_zscore,
+    }
+
+
+def add_structure_filter_args(p: argparse.ArgumentParser) -> None:
+    """Per-complex structural filters (ported from WaterFlow). All ON by default; a complex
+    is dropped if it fails any enabled check. Disable individually with --no_filter_by_*."""
+    p.add_argument("--interface_dist_threshold", type=float, default=4.0,
+                   help="Multi-chain complex dropped if its closest inter-chain approach "
+                        "exceeds this (A) — likely ASU copies, not a real interface.")
+    p.add_argument("--max_com_dist", type=float, default=25.0,
+                   help="Complex dropped if protein and water centers of mass are farther "
+                        "apart than this (A).")
+    p.add_argument("--clash_dist", type=float, default=2.0,
+                   help="Distance (A) under which a water is counted as clashing with protein.")
+    p.add_argument("--max_clash_fraction", type=float, default=0.05,
+                   help="Complex dropped if more than this fraction of waters clash.")
+    p.add_argument("--min_water_residue_ratio", type=float, default=0.1,
+                   help="Complex dropped if waters/residues is below this.")
+    p.add_argument("--filter_by_chain", action="store_true", default=True)
+    p.add_argument("--no_filter_by_chain", action="store_false", dest="filter_by_chain")
+    p.add_argument("--filter_by_com", action="store_true", default=True)
+    p.add_argument("--no_filter_by_com", action="store_false", dest="filter_by_com")
+    p.add_argument("--filter_by_clash", action="store_true", default=True)
+    p.add_argument("--no_filter_by_clash", action="store_false", dest="filter_by_clash")
+    p.add_argument("--filter_by_ratio", action="store_true", default=True)
+    p.add_argument("--no_filter_by_ratio", action="store_false", dest="filter_by_ratio")
+
+
+def structure_filter_cfg(args) -> dict:
+    """Build the per-complex filter-config dict consumed by ``passes_structure_filters``."""
+    return {
+        "filter_by_chain": args.filter_by_chain,
+        "filter_by_com": args.filter_by_com,
+        "filter_by_clash": args.filter_by_clash,
+        "filter_by_ratio": args.filter_by_ratio,
+        "interface_dist_threshold": args.interface_dist_threshold,
+        "max_com_dist": args.max_com_dist,
+        "clash_dist": args.clash_dist,
+        "max_clash_fraction": args.max_clash_fraction,
+        "min_water_residue_ratio": args.min_water_residue_ratio,
     }
 
 
@@ -307,6 +354,56 @@ def extract_protein_coords(structure) -> list[tuple[float, float, float]]:
             for atom in residue]
 
 
+def extract_protein_coords_by_chain(structure) -> dict[str, np.ndarray]:
+    """Non-water atom coordinates grouped by chain id (for the multi-chain filter)."""
+    model = next(structure.get_models())
+    by_chain: dict[str, list[tuple[float, float, float]]] = defaultdict(list)
+    for residue in model.get_residues():
+        if is_water_residue(residue):
+            continue
+        cid = str(residue.get_parent().id)
+        for atom in residue:
+            by_chain[cid].append(tuple(float(v) for v in atom.coord))
+    return {cid: np.array(coords, dtype=float) for cid, coords in by_chain.items()}
+
+
+def count_protein_residues(structure) -> int:
+    """Number of non-water residues (denominator of the water/residue ratio)."""
+    model = next(structure.get_models())
+    return sum(1 for residue in model.get_residues() if not is_water_residue(residue))
+
+
+def passes_structure_filters(structure, waters, filter_cfg, cache_key):
+    """Run the enabled per-complex checks. Return ``(True, "")`` to keep, else the skip
+    status + reason. ``waters`` are the surviving (quality-filtered) water coordinates."""
+    water_coords = np.array(waters, dtype=float)
+    protein_coords = np.array(extract_protein_coords(structure), dtype=float)
+
+    if filter_cfg["filter_by_chain"]:
+        ok, reason = check_chain_interactions(
+            extract_protein_coords_by_chain(structure),
+            interface_dist_threshold=filter_cfg["interface_dist_threshold"])
+        if not ok:
+            return False, "asu_copies", reason
+    if filter_cfg["filter_by_com"]:
+        ok, reason = check_com_distance(protein_coords, water_coords,
+                                        max_com_dist=filter_cfg["max_com_dist"])
+        if not ok:
+            return False, "com_distance", reason
+    if filter_cfg["filter_by_clash"]:
+        ok, reason = check_water_clashes(protein_coords, water_coords,
+                                         clash_dist=filter_cfg["clash_dist"],
+                                         max_clash_fraction=filter_cfg["max_clash_fraction"])
+        if not ok:
+            return False, "water_clash", reason
+    if filter_cfg["filter_by_ratio"]:
+        ok, reason = check_water_residue_ratio(len(waters), count_protein_residues(structure),
+                                               min_ratio=filter_cfg["min_water_residue_ratio"])
+        if not ok:
+            return False, "low_water_ratio", reason
+    return True, "", ""
+
+
 def write_water_pdb(coords: list[tuple[float, float, float]], path: Path) -> None:
     rows = []
     for i, (x, y, z) in enumerate(coords, start=1):
@@ -403,7 +500,7 @@ def quality_filtered_coords(records, structure, source: Path, filter_cfg: dict, 
 
 def process_one(job):
     raw_root, out_dir, entry, min_water_dist, out_format, skip_existing, \
-        download_missing, tmp_root, filter_cfg = job
+        download_missing, tmp_root, filter_cfg, struct_cfg = job
     raw_root = Path(raw_root)
     out_dir = Path(out_dir)
     dest = out_dir / entry.norm
@@ -445,6 +542,10 @@ def process_one(job):
         waters = quality_filtered_coords(records, structure, source, filter_cfg, entry.norm)
         if not waters:
             return entry.norm, "no_waters_after_filter", ""
+
+        keep, status, reason = passes_structure_filters(structure, waters, struct_cfg, entry.norm)
+        if not keep:
+            return entry.norm, status, reason
 
         dest.mkdir(parents=True, exist_ok=True)
         protein_path = dest / f"{entry.norm}_protein_processed.{out_format}"
@@ -531,9 +632,10 @@ def main(argv=None):
                                          dir=args.tmp_dir if args.tmp_dir else None))
 
     filter_cfg = water_filter_cfg(args)
+    struct_cfg = structure_filter_cfg(args)
     jobs = [(str(raw_root), str(out_dir), entry, args.min_water_dist, args.out_format,
              args.skip_existing, args.download_missing,
-             str(tmp_root) if tmp_root is not None else None, filter_cfg)
+             str(tmp_root) if tmp_root is not None else None, filter_cfg, struct_cfg)
             for entry in all_entries]
     prepared, skipped, metadata = set(), defaultdict(list), {}
     n_exists = 0

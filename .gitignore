@@ -11,7 +11,6 @@ dist/
 # Runtime outputs (predictions, logs, diffusion-process frames)
 outputs/
 .openbabel_cache/
-models/
 # SO(3)/torus precompute caches (written to CWD by older code; harmless if present)
 .so3_*.npy
 .p.npy
