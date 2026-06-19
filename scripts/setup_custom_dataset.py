@@ -545,6 +545,7 @@ def process_one(job):
 
         keep, status, reason = passes_structure_filters(structure, waters, struct_cfg, entry.norm)
         if not keep:
+            print(f"  {entry.norm}: dropped by {status} — {reason}")
             return entry.norm, status, reason
 
         dest.mkdir(parents=True, exist_ok=True)

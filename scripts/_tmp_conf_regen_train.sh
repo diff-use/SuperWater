@@ -51,4 +51,4 @@ $TORCHRUN --nproc_per_node=4 -m superwater.train \
   --scheduler plateau --scheduler_patience 30 --dropout 0.1 \
   --use_ema --cudnn_benchmark --test_sigma_intervals \
   --num_workers 10 --num_dataloader_workers 10 --pin_memory --checkpoint_freq 25 \
-  --wandb --wandb_entity vratins --project superwater_final
+ --wandb --wandb_entity vratins --project superwater_final
