@@ -171,8 +171,11 @@ def main_function():
     distributed = world_size > 1
     if distributed:
         torch.cuda.set_device(local_rank)
-        dist.init_process_group(backend='nccl')
         device = torch.device(f'cuda:{local_rank}')
+        # device_id binds the process group to this rank's GPU (eager init; avoids the
+        # "unknown device" barrier warning). The graph cache is built ahead of time via
+        # --prepare_cache_only, so no long-running work happens inside an NCCL collective.
+        dist.init_process_group(backend='nccl', device_id=device)
     else:
         device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
     is_main = (rank == 0)
@@ -199,15 +202,22 @@ def main_function():
 
     # construct loader
     t_to_sigma = partial(t_to_sigma_compl, args=args)
-    # Build the graph cache on rank 0 first: non-main ranks wait at the barrier while rank 0
-    # preprocesses, then they only read the cache. Without this, every rank writes the same
-    # .pt files concurrently (corruption + redundant work) on a fresh/partial cache.
+    # The cache is normally prebuilt single-process via --prepare_cache_only, so this is just
+    # a read. The rank-0-first barrier is a safety net: if the cache is cold, rank 0 builds it
+    # while the others wait, instead of every rank writing the same .pt files concurrently.
     if distributed and not is_main:
         dist.barrier()
     train_loader, val_loader, infer_loader = construct_loader(
         args, t_to_sigma, distributed=distributed, rank=rank, world_size=world_size)
     if distributed and is_main:
         dist.barrier()
+
+    if args.prepare_cache_only:
+        if is_main:
+            print("Graph cache prepared; exiting (--prepare_cache_only).")
+        if distributed:
+            dist.destroy_process_group()
+        return
 
     # Build the bare model, optionally restore weights, then wrap in DDP. Wrapping after the
     # restore means DDP broadcasts the (loaded) rank-0 weights to all ranks at construction.
