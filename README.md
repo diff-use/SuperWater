@@ -261,6 +261,15 @@ preprocessed into a graph cache on the first run and reused afterwards; complexe
 graph preprocessing are recorded in `failed_complexes.txt` in the cache directory (the only
 other trace is a missing `<name>.pt`).
 
+**Multi-GPU:** swap `python` for `torchrun --standalone --nnodes=1 --nproc_per_node=<N>`
+(same args) to train on `N` GPUs with DDP. Effective batch size becomes
+`--batch_size × N`, so scale `--lr` accordingly.
+
+**Resume:** add `--restart_dir models/water_score_res15_retrain` to continue from the exact
+epoch a run stopped at (it restores model/optimizer/scheduler/EMA from `last_model.pt`).
+`--n_epochs` is the absolute target — set `--n_epochs 300` to take a run that stopped at
+epoch 100 up to 300 total. See [docs/RUNNING.md §3.4–3.5](docs/RUNNING.md) for details.
+
 ### 4. Train the confidence model
 
 This samples water positions with the score model from step 3, caches them, and trains a

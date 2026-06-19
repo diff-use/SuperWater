@@ -24,11 +24,22 @@ from superwater.utils.training import train_epoch, test_epoch, loss_function
 from superwater.utils.utils import save_yaml_file, get_optimizer_and_scheduler, get_model, ExponentialMovingAverage
 
 
+def resume_bookkeeping(restart_state):
+    """Derive (start_epoch, best_val_loss, best_epoch) from a `last_model.pt` checkpoint dict.
+
+    `start_epoch` is the next epoch to run (saved epoch + 1), so training continues exactly
+    where it stopped. `.get()` keeps checkpoints written before scheduler/best-tracking was
+    added loadable: they fall back to inf / the resumed epoch."""
+    start_epoch = restart_state['epoch'] + 1
+    best_val_loss = restart_state.get('best_val_loss', math.inf)
+    best_epoch = restart_state.get('best_epoch', restart_state['epoch'])
+    return start_epoch, best_val_loss, best_epoch
+
+
 def train(args, model, optimizer, scheduler, ema_weights, train_loader, val_loader, infer_loader,
-          t_to_sigma, run_dir, device, distributed=False, is_main=True):
-    best_val_loss = math.inf
+          t_to_sigma, run_dir, device, distributed=False, is_main=True,
+          start_epoch=0, best_val_loss=math.inf, best_epoch=0):
     best_val_inference_value = math.inf if args.inference_earlystop_goal == 'min' else 0
-    best_epoch = 0
     best_val_inference_epoch = 0
     loss_fn = partial(loss_function, tr_weight=args.tr_weight)
 
@@ -38,13 +49,16 @@ def train(args, model, optimizer, scheduler, ema_weights, train_loader, val_load
 
     # Only the main rank writes CSV logs; other ranks use a no-op iteration logger.
     if is_main:
-        print("Starting training...")
-        iter_f = open(os.path.join(run_dir, 'losses_iter.csv'), 'w', newline='')
-        epoch_f = open(os.path.join(run_dir, 'losses_epoch.csv'), 'w', newline='')
+        print("Starting training..." if start_epoch == 0 else f"Resuming training from epoch {start_epoch}...")
+        # Append (and skip the header) when resuming so the existing loss history is preserved.
+        csv_mode = 'w' if start_epoch == 0 else 'a'
+        iter_f = open(os.path.join(run_dir, 'losses_iter.csv'), csv_mode, newline='')
+        epoch_f = open(os.path.join(run_dir, 'losses_epoch.csv'), csv_mode, newline='')
         iter_writer = csv.writer(iter_f)
         epoch_writer = csv.writer(epoch_f)
-        iter_writer.writerow(['epoch', 'iteration', 'loss', 'tr_loss', 'tr_base_loss'])
-        epoch_writer.writerow(['epoch', 'split', 'loss', 'tr_loss', 'tr_base_loss'])
+        if start_epoch == 0:
+            iter_writer.writerow(['epoch', 'iteration', 'loss', 'tr_loss', 'tr_base_loss'])
+            epoch_writer.writerow(['epoch', 'split', 'loss', 'tr_loss', 'tr_base_loss'])
 
         def log_iter(epoch, batch_idx, loss, tr_loss, tr_base_loss):
             iter_writer.writerow([epoch, batch_idx, loss, tr_loss, tr_base_loss])
@@ -53,7 +67,7 @@ def train(args, model, optimizer, scheduler, ema_weights, train_loader, val_load
         log_iter = None
 
     try:
-        for epoch in range(args.n_epochs):
+        for epoch in range(start_epoch, args.n_epochs):
             if is_main and epoch % 5 == 0: print("Run name: ", args.run_name)
             logs = {}
             train_losses = train_epoch(model, train_loader, optimizer, device, t_to_sigma, loss_fn, ema_weights,
@@ -84,8 +98,13 @@ def train(args, model, optimizer, scheduler, ema_weights, train_loader, val_load
                 iter_f.flush()
 
                 if args.wandb:
-                    logs.update({'train_' + k: v for k, v in train_losses.items()})
-                    logs.update({'val_' + k: v for k, v in val_losses.items()})
+                    # Log the same metrics the CSV/console record. Dumping every key instead
+                    # would add the 30 per-interval metrics from --test_sigma_intervals
+                    # (int0_*..int9_*), whose base-loss values are huge (~800 at epoch 0) and
+                    # never appear in the train logs — noisy and misleading on the dashboard.
+                    log_keys = ['loss', 'tr_loss', 'tr_base_loss']
+                    logs.update({'train_' + k: train_losses[k] for k in log_keys})
+                    logs.update({'val_' + k: val_losses[k] for k in log_keys})
                     logs['current_lr'] = optimizer.param_groups[0]['lr']
                     wandb.log(logs, step=epoch + 1)
 
@@ -113,7 +132,10 @@ def train(args, model, optimizer, scheduler, ema_weights, train_loader, val_load
                     'epoch': epoch,
                     'model': state_dict,
                     'optimizer': optimizer.state_dict(),
+                    'scheduler': scheduler.state_dict() if scheduler is not None else None,
                     'ema_weights': ema_weights.state_dict(),
+                    'best_val_loss': best_val_loss,
+                    'best_epoch': best_epoch,
                 }, os.path.join(run_dir, 'last_model.pt'))
 
                 if args.checkpoint_freq > 0 and (epoch + 1) % args.checkpoint_freq == 0:
@@ -204,11 +226,23 @@ def main_function():
     optimizer, scheduler = get_optimizer_and_scheduler(args, model, scheduler_mode=args.inference_earlystop_goal if args.val_inference_freq is not None else 'min')
     ema_weights = ExponentialMovingAverage(model.parameters(), decay=args.ema_rate)
 
+    start_epoch, best_val_loss, best_epoch = 0, math.inf, 0
     if restart_state is not None:
         if args.restart_lr is not None: restart_state['optimizer']['param_groups'][0]['lr'] = args.restart_lr
         optimizer.load_state_dict(restart_state['optimizer'])
         if hasattr(args, 'ema_rate'):
             ema_weights.load_state_dict(restart_state['ema_weights'], device=device)
+        # Resume the epoch counter, LR scheduler, and best-checkpoint tracking so training
+        # continues exactly where it left off.
+        if scheduler is not None and restart_state.get('scheduler') is not None:
+            scheduler.load_state_dict(restart_state['scheduler'])
+        start_epoch, best_val_loss, best_epoch = resume_bookkeeping(restart_state)
+        if is_main:
+            print(f"Resuming at epoch {start_epoch} (target n_epochs={args.n_epochs}); "
+                  f"best_val_loss={best_val_loss} @ epoch {best_epoch}")
+            if start_epoch >= args.n_epochs:
+                print(f"WARNING: start_epoch ({start_epoch}) >= n_epochs ({args.n_epochs}); "
+                      f"no epochs will run. Increase --n_epochs to continue training.")
 
     numel = sum([p.numel() for p in model.parameters()])
     if is_main: print('Model with', numel, 'parameters')
@@ -233,7 +267,8 @@ def main_function():
     args.device = device
 
     train(args, model, optimizer, scheduler, ema_weights, train_loader, val_loader, infer_loader,
-          t_to_sigma, run_dir, device, distributed=distributed, is_main=is_main)
+          t_to_sigma, run_dir, device, distributed=distributed, is_main=is_main,
+          start_epoch=start_epoch, best_val_loss=best_val_loss, best_epoch=best_epoch)
 
     if distributed:
         dist.barrier()

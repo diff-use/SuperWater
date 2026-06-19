@@ -235,7 +235,9 @@ The command above reproduces the shipped `models/water_score_res15` checkpoint. 
 **Outputs** (`models/<run_name>/`):
 
 - `best_model.pt`, `best_ema_model.pt`, `last_model.pt` — checkpoints (EMA only with
-  `--use_ema`). `last_model.pt` also holds optimizer/EMA state for `--restart_dir`.
+  `--use_ema`). `last_model.pt` is rewritten every epoch and holds the full resume state —
+  epoch number, optimizer, LR scheduler, EMA weights, and best-val tracking — for
+  `--restart_dir` (see [Resuming a run](#35-resuming-a-run)).
 - `model_parameters.yml` — full arg snapshot; downstream stages read graph/arch params from
   here, so the dataset only needs to be specified once.
 - `losses_iter.csv` (per batch) and `losses_epoch.csv` (per-epoch train/val) — plot with
@@ -256,6 +258,48 @@ The command above reproduces the shipped `models/water_score_res15` checkpoint. 
 
 Complexes that fail graph preprocessing are recorded in `failed_complexes.txt` inside the
 cache directory; the only other trace is a missing `<name>.pt`.
+
+### 3.4 Multi-GPU training (DDP)
+
+Training supports single-node, multi-GPU `DistributedDataParallel`. Launch with `torchrun`
+instead of `python` and the same `superwater.train` args — no code flags change:
+
+```bash
+torchrun --standalone --nnodes=1 --nproc_per_node=4 -m superwater.train \
+    --run_name water_score_res15_ddp \
+    ...same args as the single-GPU command above...
+```
+
+- `--nproc_per_node` = number of GPUs (one process per GPU). `superwater.train` reads
+  `WORLD_SIZE`/`RANK`/`LOCAL_RANK` from `torchrun`; with `WORLD_SIZE=1` (plain `python -m
+  superwater.train`) it transparently falls back to single-GPU/CPU, so the same entry point
+  serves both.
+- Backend is **NCCL**. The dataset is sharded across ranks by a `DistributedSampler`, so the
+  **effective batch size is `--batch_size × nproc_per_node`** — scale `--lr` accordingly.
+- Each rank offsets its seed by `rank` so the diffusion noise differs per shard; validation
+  loss is all-reduced so every rank agrees on best-model and scheduler decisions.
+- Only **rank 0** writes checkpoints, CSV logs, and W&B — no duplicate output.
+
+### 3.5 Resuming a run
+
+`--restart_dir <models/run_name>` resumes from that run's `last_model.pt`, restoring model,
+optimizer, LR scheduler, EMA, and best-val tracking, then **continuing from the exact epoch
+the run stopped at** (e.g. killed after epoch 99 → resumes at epoch 100).
+
+`--n_epochs` is the **absolute target**, not a count of additional epochs: to extend a run
+that stopped at epoch 100 to 300 total, resume with `--n_epochs 300` (runs epochs 100–299).
+If `--n_epochs` ≤ the completed epoch, no epochs run and a warning is printed — raise it to
+continue. Loss CSVs are appended (not truncated) on resume, preserving the full history.
+
+```bash
+# extend the run above from wherever it stopped, up to 300 epochs total
+python -m superwater.train --restart_dir models/water_score_res15_retrain \
+    --n_epochs 300 ...same args as the original command...
+```
+
+Resume works the same under `torchrun` for DDP runs. Checkpoints written before this
+resume support existed (lacking scheduler/best-val state) still load — those fields fall
+back to defaults. `--restart_lr <lr>` overrides the optimizer LR on resume.
 
 ---
 
