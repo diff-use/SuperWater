@@ -13,6 +13,7 @@ from tqdm import tqdm
 
 from superwater.datasets.pdbbind import PDBBind
 from superwater.confidence.dataset import ConfidenceDataset, get_args
+from superwater.confidence.candidates import generate_candidates
 from superwater.utils.utils import save_yaml_file, get_model, resolve_model_dir
 from superwater.utils.diffusion_utils import t_to_sigma as t_to_sigma_compl
 from superwater.utils.cluster_centroid import find_centroids
@@ -114,7 +115,10 @@ def construct_loader_origin(args_inference, args_score, t_to_sigma):
                    'popsize': args_score.matching_popsize, 'maxiter': args_score.matching_maxiter,
                    'num_workers': args_score.num_workers, 'all_atoms': args_score.all_atoms,
                    'atom_radius': args_score.atom_radius, 'atom_max_neighbors': args_score.atom_max_neighbors,
-                   'esm_embeddings_path': args_inference.esm_embeddings_path}
+                   'esm_embeddings_path': args_inference.esm_embeddings_path,
+                   # Honour --cache_scope so a dataset-scope run reuses the score model's prebuilt
+                   # per-complex graphs instead of rebuilding them split-scoped.
+                   'cache_scope': getattr(args_inference, 'cache_scope', 'split')}
 
     print('esm_embeddings_path:', args_inference.esm_embeddings_path)
 
@@ -126,26 +130,33 @@ def construct_loader_origin(args_inference, args_score, t_to_sigma):
 
 
 def construct_loader_confidence(args, device, score_model=None):
+    original_model_args = get_args(args.original_model_dir)
+    t_to_sigma = partial(t_to_sigma_compl, args=original_model_args)
+    test_loader = construct_loader_origin(args, original_model_args, t_to_sigma)
+    split_name = os.path.splitext(os.path.basename(args.split_test))[0]
+
+    # Inference = "generate candidates -> score them". ConfidenceDataset is load-only, so first
+    # sample the candidate positions for this split (reusing the already-built test_loader, the
+    # preloaded score model, and the inference data_dir), then load them. Idempotent: an existing
+    # cache for this (score model, split) is reused.
+    generate_candidates(args, original_model_args, args.split_test, split_name, device,
+                        loader=test_loader, score_model=score_model, data_dir=args.data_dir)
+
     common_args = {'cache_path': args.cache_path, 'original_model_dir': args.original_model_dir, 'device': device,
                    'inference_steps': args.inference_steps, 'samples_per_complex': args.samples_per_complex,
-                   'limit_complexes': args.limit_complexes, 'all_atoms': args.all_atoms, 'balance': args.balance,
+                   'limit_complexes': args.limit_complexes,
+                   # The cached graphs are the score model's, so featurization flags follow it.
+                   'all_atoms': original_model_args.all_atoms, 'balance': args.balance,
                    'mad_classification_cutoff': args.mad_classification_cutoff,
                    'use_original_model_cache': args.use_original_model_cache,
                    'cache_creation_id': args.cache_creation_id, "cache_ids_to_combine": args.cache_ids_to_combine,
                    "model_ckpt": args.ckpt,
                    "running_mode": args.running_mode,
                    "water_ratio": args.water_ratio,
-                   "resample_steps": args.resample_steps,
-                   "save_visualization": args.save_visualization,
-                   "score_model": score_model}
+                   "resample_steps": args.resample_steps}
     loader_class = DataListLoader if torch.cuda.is_available() else DataLoader
 
-    original_model_args = get_args(args.original_model_dir)
-    t_to_sigma = partial(t_to_sigma_compl, args=original_model_args)
-    test_loader = construct_loader_origin(args, original_model_args, t_to_sigma)
-
-    test_dataset = ConfidenceDataset(loader=test_loader, split=os.path.splitext(os.path.basename(args.split_test))[0],
-                                     args=args, **common_args)
+    test_dataset = ConfidenceDataset(loader=test_loader, split=split_name, args=args, **common_args)
     return loader_class(dataset=test_dataset, batch_size=args.batch_size, shuffle=False)
 
 

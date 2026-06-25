@@ -332,64 +332,94 @@ top of the script before use.
 
 ## 5. Confidence model setup + training
 
-The confidence model is a classifier that scores each sampled water particle by how far it
-is likely to be from a true hydration site. **Setup is implicit in training**: the first
-training run uses the trained score model (step 3) to sample water positions for every
-complex, computes each particle's mean-absolute-deviation (MAD) from the nearest true
-water, and caches `(positions, MAD)` pairs; the classifier then trains on that cache.
+The confidence model scores each sampled water particle by how far it is likely to land from a
+true hydration site. Training has **two explicit steps that share one entry point**
+(`superwater-confidence-train` ≡ `python -m superwater.confidence.train`):
 
-Entry point: `superwater-confidence-train` (≡ `python -m superwater.confidence.train`). The
-dataset/architecture flags must match the score model.
+1. **Generate candidates** (`--generate_candidates_only`) — use the trained score model (step 3)
+   to sample water positions for every train + val complex, compute each particle's
+   mean-absolute-deviation (MAD) to the nearest true water, and cache the `(positions, MAD)`
+   pairs. Run once; can be sharded across GPUs with `torchrun`.
+2. **Train the classifier** (DDP, multi-GPU) on that warm cache.
+
+Splitting the steps is deliberate: candidate generation is a sequential sampling job, so running
+it inside the training job would mean every DDP rank sampling concurrently. If the cache is
+missing, training fails fast with a message telling you to run step 1 first.
+
+**Graph reuse / inherited flags.** Graph construction reads `data_dir` / `cache_path` /
+`cache_scope` and the featurization (`all_atoms`, `receptor_radius`, ESM, …) from the **score
+model's** `model_parameters.yml`, so pointing `--cache_path` / `--cache_scope dataset` at the
+score model's dataset cache reuses its per-complex `.pt` graphs instead of rebuilding them. The
+confidence model also **inherits `all_atoms` and the ESM setting from the score model**, so you
+only specify the confidence model's own capacity (`--ns/--nv/--num_conv_layers`, embed dims,
+`--dropout`) and the training/optimization flags.
+
+### 5.1 Step 1 — generate the candidate cache
 
 ```bash
-python -m superwater.confidence.train \
-    --original_model_dir models/water_score_res15 \
-    --run_name water_confidence_res15_retrain \
-    --data_dir data/<dataset> \
-    --esm_embeddings_path data/<dataset>_embeddings \
+# Sharded across 4 GPUs (single-process == drop `torchrun ...`, run `python -m ...`).
+torchrun --standalone --nproc_per_node=4 -m superwater.confidence.train --generate_candidates_only \
+    --original_model_dir models/water_score_res15 --ckpt best_model.pt \
+    --cache_path data/cache_confidence --cache_scope dataset \
     --split_train examples/data/splits/train_res15.txt \
     --split_val   examples/data/splits/val_res15.txt \
-    --split_test  examples/data/splits/test_res15.txt \
-    --log_dir models \
-    --all_atoms --remove_hs \
-    --ns 24 --nv 6 --num_conv_layers 3 --scale_by_sigma --dynamic_max_cross --dropout 0.1 \
-    --inference_steps 20 --water_ratio 15 \
-    --lr 1e-3 --batch_size 8 --n_epochs 50 \
-    --running_mode train --mad_prediction \
-    --cache_creation_id 1 --cache_ids_to_combine 1 \
-    --cache_scope dataset
+    --inference_steps 20 --water_ratio 15 --cache_creation_id 1
 ```
-
-**The cache-building (setup) stage.** The first run is slow: it samples and caches water
-positions for every train + val complex (under `--cache_path`, default
-`data/cache_confidence`); later runs reuse that cache. The relevant flags:
 
 | Flag | Meaning |
 |------|---------|
-| `--original_model_dir` | Trained score model whose checkpoint (`--ckpt`, default `best_model.pt`) samples the positions. Its `model_parameters.yml` also supplies the graph/arch params. |
-| `--water_ratio` | Particles sampled per residue when building the cache. Lower (e.g. 10) on GPU-memory limits. |
-| `--inference_steps` | Reverse-diffusion steps used while sampling the cache. |
+| `--original_model_dir` / `--ckpt` | Trained score model + checkpoint (default `best_model.pt`) that samples the positions. Its `model_parameters.yml` supplies the graph/featurization params. **Pass the identical `--original_model_dir` string in step 2** — the cache directory is keyed by its basename. |
+| `--water_ratio` | Particles sampled per residue. Lower (e.g. 10) on GPU-memory limits. |
+| `--inference_steps` | Reverse-diffusion steps used while sampling (default 20). |
 | `--resample_steps` | Independent resampling passes per complex (total ratio = `water_ratio × resample_steps`). |
-| `--cache_creation_id` | Tags this sampling pass; run multiple ids to accumulate more samples. |
-| `--cache_ids_to_combine` | Which `cache_creation_id`s to concatenate into the training set (e.g. `1 2 3`). |
-| `--cache_path` / `--cache_scope` | Where the sampled-position cache lives. |
+| `--cache_creation_id` | Tags this sampling pass; run more ids (2, 3, …) to accumulate samples, then combine them in step 2 with `--cache_ids_to_combine`. |
+| `--cache_path` / `--cache_scope` | Where the candidate pkls live; point at the score model's `dataset` cache to reuse graphs. |
+| `--limit_complexes N` | Sample only the first `N` complexes per split (handy for smoke tests). |
 
-**The classifier training stage.** Trained on the cache:
+Under `torchrun` each rank samples a disjoint subset of complexes into a per-rank shard, then
+rank 0 merges the shards into `water_positions_id<cid>.pkl`. The step is idempotent — an existing
+cache for `<cid>` is skipped.
+
+### 5.2 Step 2 — train the confidence classifier (DDP)
+
+```bash
+torchrun --standalone --nproc_per_node=4 -m superwater.confidence.train \
+    --original_model_dir models/water_score_res15 --ckpt best_model.pt \
+    --cache_path data/cache_confidence --cache_scope dataset \
+    --split_train examples/data/splits/train_res15.txt \
+    --split_val   examples/data/splits/val_res15.txt \
+    --log_dir models --run_name water_confidence_res15_retrain \
+    --ns 24 --nv 6 --num_conv_layers 3 --scale_by_sigma --dynamic_max_cross --dropout 0.1 \
+    --mad_prediction --cache_creation_id 1 --cache_ids_to_combine 1 \
+    --lr 1e-3 --batch_size 8 --n_epochs 50 --scheduler plateau --scheduler_patience 50 \
+    --num_dataloader_workers 10 --pin_memory --checkpoint_freq 25
+```
 
 | Flag | Meaning |
 |------|---------|
 | `--mad_prediction` | Regress the (sigmoid-normalized) MAD with MSE loss — the shipped `water_confidence_res15_sigmoid` head. Omit for binary classification with `--mad_classification_cutoff`. |
 | `--mad_classification_cutoff` | MAD threshold (Å) defining a positive when not using `--mad_prediction`; a list enables multi-bin cross-entropy. |
-| `--balance` | Keep natural positive/negative ratio instead of balancing. |
+| `--cache_ids_to_combine` | Which `cache_creation_id`s (from step 1) to concatenate into the training set (e.g. `1 2 3`). |
+| `--balance` | Keep the natural positive/negative ratio instead of balancing. |
+| `--ns/--nv/--num_conv_layers`, embed dims, `--dropout` | Confidence model capacity. |
 | `--n_epochs`, `--batch_size`, `--lr`, `--scheduler`, `--scheduler_patience` | Optimization. |
-| `--main_metric` / `--main_metric_goal` | Early-stopping metric (`confidence_loss`/`accuracy`/`ROC AUC`; default `min` confidence_loss). |
+| `--num_dataloader_workers`, `--pin_memory`, `--checkpoint_freq` | Dataloader + periodic checkpointing (mirror the score-training flags). |
+| `--main_metric` / `--main_metric_goal` | Early-stopping metric (default `min confidence_loss`). |
 | `--transfer_weights` | Initialize from the score model's weights (uses `--original_model_dir` arch). |
-| `--restart_dir` | Resume from a previous confidence run's `last_model.pt`. |
+| `--restart_dir` | Resume from a previous confidence run's `last_model.pt` (restores epoch, optimizer, scheduler, best tracking). |
 
-**Outputs** (`models/<run_name>/`): `best_model.pt`, `last_model.pt`,
-`model_parameters.yml`, and (with `--model_save_frequency`/`--best_model_save_frequency`)
-periodic `model_epoch<N>.pt` / `best_model_epoch<N>.pt`. Validation prints loss and, for the
-classifier head, accuracy and ROC-AUC each epoch.
+> **DDP note.** Keep `--find_unused_parameters` at its default (**on**): the confidence model is
+> the score backbone plus a confidence head, and the backbone's translation-output layers are
+> unused in confidence mode, so DDP must allow unused parameters. BatchNorm is converted to
+> `SyncBatchNorm` automatically under DDP; `--confidence_no_batchnorm` is the escape hatch. The
+> `confidence_loss` (and accuracy) are all-reduced across ranks; per-shard `ROC AUC` is a
+> diagnostic only.
+
+**Outputs** (`<log_dir>/<run_name>/`): `best_model.pt` (a bare state-dict — the format
+`superwater-infer` / `superwater-predict` load), `last_model.pt` (resume dict), and
+`model_parameters.yml`, plus periodic `model_epoch<N>.pt` with `--checkpoint_freq` /
+`--model_save_frequency`. Validation prints loss each epoch (accuracy + ROC-AUC for the
+classifier head).
 
 ---
 

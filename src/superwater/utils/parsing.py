@@ -108,9 +108,21 @@ def parse_confidence_args(argv=None):
                         help='split: cache keyed by split filename; dataset: reuse per-complex graphs across split files')
     parser.add_argument('--cache_ids_to_combine', nargs='+', type=str, default=None, help='')
     parser.add_argument('--cache_creation_id', type=int, default=None, help='number of times that inference is run on the full dataset before concatenating it and coming up with the full confidence dataset')
+    parser.add_argument('--generate_candidates_only', action='store_true', default=False,
+                        help='Sample the candidate cache (water positions + MADs) for the train and val '
+                             'splits using the score model, then exit before confidence training. Run this '
+                             '(single-process or torchrun-sharded) so the subsequent DDP train reads a warm '
+                             'cache instead of N ranks sampling concurrently.')
     parser.add_argument('--wandb', action='store_true', default=False, help='Whether to log to Weights & Biases')
     parser.add_argument('--wandb_entity', type=str, default=None, help='W&B entity (username or team). If None, uses your default W&B entity.')
-    parser.add_argument('--inference_steps', type=int, default=2, help='Number of denoising steps')
+    # DDP / dataloader (mirror the score-training flags so the two pipelines launch the same way).
+    parser.add_argument('--find_unused_parameters', action=BooleanOptionalAction, default=True,
+                        help='DDP: traverse the autograd graph to allow parameters unused in a given backward. '
+                             'The confidence head is fully used, so --no-find_unused_parameters is usually correct.')
+    parser.add_argument('--num_dataloader_workers', type=int, default=0, help='Number of workers for the training dataloader')
+    parser.add_argument('--pin_memory', action='store_true', default=False, help='pin_memory arg of the dataloader')
+    parser.add_argument('--checkpoint_freq', type=int, default=0, help='Save a numbered checkpoint every N epochs. 0 disables.')
+    parser.add_argument('--inference_steps', type=int, default=20, help='Number of denoising steps')
     parser.add_argument('--samples_per_complex', type=int, default=1, help='')
     parser.add_argument('--balance', action='store_true', default=False, help='If this is true than we do not force the samples seen during training to be the same amount of negatives as positives')
     parser.add_argument('--mad_prediction', action='store_true', default=False, help='')

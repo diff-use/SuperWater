@@ -1,25 +1,13 @@
-import copy
 import math
 import os
 import pickle
 import random
-import time
 from argparse import Namespace
-from functools import partial
 
 import numpy as np
 import torch
 import yaml
 from torch_geometric.data import Dataset, Data
-from tqdm import tqdm
-
-from superwater.utils.diffusion_utils import get_t_schedule
-from superwater.utils.utils import get_model
-from superwater.utils.diffusion_utils import t_to_sigma as t_to_sigma_compl
-from superwater.utils.sampling import sampling, randomize_position_multiple
-from superwater.utils.nearest_point_dist import get_nearest_point_distances
-from superwater.utils.find_water_pos import find_real_water_pos
-from superwater.structure_io import structure_path
 
 
 class ListDataset(Dataset):
@@ -38,18 +26,27 @@ def get_args(original_model_dir):
         model_args = Namespace(**yaml.full_load(f))
     return model_args
 
+def confidence_cache_path(cache_path, original_model_dir, split, limit_complexes):
+    """Directory holding the sampled candidate cache for one score model + split.
+
+    Keyed by the score-dir basename so candidate caches sampled from different score
+    checkpoints (e.g. conf vs large) coexist under the same ``--cache_path``. The
+    generator (``superwater.confidence.candidates``) and ``ConfidenceDataset`` MUST
+    agree on this layout, so both call this helper."""
+    return os.path.join(
+        cache_path,
+        f'model_{os.path.splitext(os.path.basename(original_model_dir))[0]}'
+        f'_split_{split}_limit_{limit_complexes}')
+
 class ConfidenceDataset(Dataset):
     def __init__(self, loader, cache_path, original_model_dir, split, device, limit_complexes,
                  inference_steps, samples_per_complex, all_atoms,
                  args, model_ckpt, balance=False, use_original_model_cache=True, mad_classification_cutoff=2,
-                 cache_ids_to_combine=None, cache_creation_id=None, running_mode=None, water_ratio=15, resample_steps=1,
-                 save_visualization=False, score_model=None):
+                 cache_ids_to_combine=None, cache_creation_id=None, running_mode=None, water_ratio=15, resample_steps=1):
 
         super(ConfidenceDataset, self).__init__()
         self.loader = loader
         self.device = device
-        # Optional preloaded score model, reused across a batch to avoid reloading per structure.
-        self.score_model = score_model
         self.inference_steps = inference_steps
         self.limit_complexes = limit_complexes
         self.all_atoms = all_atoms
@@ -62,27 +59,29 @@ class ConfidenceDataset(Dataset):
         self.samples_per_complex = samples_per_complex
         self.model_ckpt = model_ckpt
         self.args = args
-        
+
         self.running_mode = running_mode
         self.water_ratio = water_ratio
         self.resample_steps = resample_steps
-        self.save_visualization = save_visualization
-        
-        self.original_model_args, original_model_cache = get_args(original_model_dir), self.loader.dataset.full_cache_path
-        
-        # check if the docked positions have already been computed, if not run the preprocessing (docking every complex)
-        self.full_cache_path = os.path.join(cache_path, f'model_{os.path.splitext(os.path.basename(original_model_dir))[0]}'
-                                            f'_split_{split}_limit_{limit_complexes}')
+
+        self.original_model_args = get_args(original_model_dir)
+
+        # Load-only: the candidate cache (water positions + MADs) is sampled ahead of time by
+        # superwater.confidence.candidates (via --generate_candidates_only). This dataset never
+        # samples — that keeps N DDP ranks from generating concurrently. A missing cache raises
+        # below with instructions to run candidate generation first.
+        self.full_cache_path = confidence_cache_path(cache_path, original_model_dir, split, limit_complexes)
         print("cache path is ", self.full_cache_path)
-        if (not os.path.exists(os.path.join(self.full_cache_path, "water_positions.pkl")) and self.cache_creation_id is None) or \
-            (not os.path.exists(os.path.join(self.full_cache_path, f"water_positions_id{self.cache_creation_id}.pkl")) and self.cache_creation_id is not None):
-            os.makedirs(self.full_cache_path, exist_ok=True)
-            self.preprocessing(original_model_cache)
-        
+
         all_mads_unsorted, all_full_water_positions_unsorted, all_names_unsorted = [], [], []
         for idx, cache_id in enumerate(self.cache_ids_to_combine):
-            print(f'HAPPENING | Loading positions and MADs from cache_id from the path: {os.path.join(self.full_cache_path, "water_positions_"+ str(cache_id)+ ".pkl")}')
-            if not os.path.exists(os.path.join(self.full_cache_path, f"water_positions_id{cache_id}.pkl")): raise Exception(f'The generated water positions with cache_id do not exist: {cache_id}') # do not change this message: confidence/train.py matches on it in a try/except
+            print(f'HAPPENING | Loading positions and MADs from cache_id from the path: {os.path.join(self.full_cache_path, "water_positions_id"+ str(cache_id)+ ".pkl")}')
+            if not os.path.exists(os.path.join(self.full_cache_path, f"water_positions_id{cache_id}.pkl")):
+                raise FileNotFoundError(
+                    f'Candidate cache missing: {os.path.join(self.full_cache_path, f"water_positions_id{cache_id}.pkl")}\n'
+                    f'Generate it first (single-process or torchrun-sharded), e.g.:\n'
+                    f'  python -m superwater.confidence.train --generate_candidates_only '
+                    f'--original_model_dir {original_model_dir} --cache_creation_id {cache_id} ...')
             with open(os.path.join(self.full_cache_path, f"water_positions_id{cache_id}.pkl"), 'rb') as f:
                 full_water_positions, mads = pickle.load(f)
             with open(os.path.join(self.full_cache_path, f"complex_names_in_same_order_id{cache_id}.pkl"), 'rb') as f:
@@ -123,7 +122,9 @@ class ConfidenceDataset(Dataset):
 
     def get(self, idx):
         complex_name = self.dataset_names[idx]
-        complex_graph = torch.load(os.path.join(self.loader.dataset.full_cache_path, f"{complex_name}.pt"))
+        # weights_only=False: the cached graph is a full PyG HeteroData object, not a state dict
+        # (matches PDBBind.get). torch>=2.6 defaults weights_only=True, which rejects it.
+        complex_graph = torch.load(os.path.join(self.loader.dataset.full_cache_path, f"{complex_name}.pt"), weights_only=False)
         positions, mads = self.positions_mads_dict[self.dataset_names[idx]]
         
         assert(complex_graph.name == self.dataset_names[idx])
@@ -163,110 +164,6 @@ class ConfidenceDataset(Dataset):
             complex_graph['atom'].node_t = {'tr': 0 * torch.ones(complex_graph['atom'].num_nodes)}
         complex_graph.complex_t = {'tr': 0 * torch.ones(1)}
         return complex_graph
-
-    def preprocessing(self, original_model_cache):
-        log_data = []
-        log_dir = "outputs/logs"
-        os.makedirs(log_dir, exist_ok=True)
-        
-        t_to_sigma = partial(t_to_sigma_compl, args=self.original_model_args)
-
-        if self.score_model is not None:
-            model = self.score_model  # reuse the preloaded score model (batch optimization)
-        else:
-            model = get_model(self.original_model_args, self.device, t_to_sigma=t_to_sigma, no_parallel=True)
-            state_dict = torch.load(f'{self.original_model_dir}/{self.model_ckpt}',
-                                    map_location=torch.device('cpu'), weights_only=True)
-            model.load_state_dict(state_dict, strict=True)
-            model = model.to(self.device)
-        model.eval()
-        
-        tr_schedule = get_t_schedule(inference_steps=self.inference_steps)
-        
-        print('Running mode: ', self.running_mode)
-
-        if self.running_mode == "train":
-            water_ratio = self.water_ratio
-            resample_steps = self.resample_steps
-        elif self.running_mode == "test":
-            water_ratio = self.water_ratio
-            resample_steps = self.resample_steps
-        else:
-            raise ValueError("Invalid running mode!")
-        total_resample_ratio = water_ratio * resample_steps
-        print('common t schedule', tr_schedule)
-        print('water_number/residue_number ratio: ', water_ratio)
-        print('resampling steps: ', resample_steps)
-        print('total resampling ratio: ', total_resample_ratio)
-        
-        mads, full_water_positions, names = [], [], []
-        for idx, orig_complex_graph in tqdm(enumerate(self.loader)):
-            pdb_name = orig_complex_graph[0]['name']
-            start_time = time.time()
-            
-            data_list = [copy.deepcopy(orig_complex_graph) for _ in range(self.samples_per_complex)]
-            res_num = int(orig_complex_graph[0]['receptor'].pos.shape[0])
-            step_num_water = int(res_num * water_ratio)
-            total_num_water = int(res_num * total_resample_ratio)
-            total_sampled_water = 0
-        
-            prediction_list = []
-            confidence_list = []
-            
-            for i in range(resample_steps):
-                sample_data_list = copy.deepcopy(data_list)
-                randomize_position_multiple(sample_data_list, False, self.original_model_args.tr_sigma_max, water_num=step_num_water)
-
-                predictions, confidences = sampling(data_list=sample_data_list, model=model,
-                                                    inference_steps=self.inference_steps,
-                                                    tr_schedule=tr_schedule,
-                                                    device=self.device, t_to_sigma=t_to_sigma, model_args=self.original_model_args,
-                                                    save_visualization=self.save_visualization)
-                prediction_list.append(predictions)
-                confidence_list.append(confidences)
-                
-             
-            orig_complex_graph['ligand'].orig_pos = (orig_complex_graph['ligand'].pos.cpu().numpy() + orig_complex_graph.original_center.cpu().numpy())
-            orig_water_pos = np.expand_dims(orig_complex_graph['ligand'].orig_pos - orig_complex_graph.original_center.cpu().numpy(), axis=0)
-
-            if isinstance(orig_complex_graph['ligand'].orig_pos, list):
-                orig_complex_graph['ligand'].orig_pos = orig_complex_graph['ligand'].orig_pos[0]
-                
-            _water_name = orig_complex_graph.name[0]
-            real_water_pos = find_real_water_pos(
-                structure_path(os.path.join(self.args.data_dir, _water_name), _water_name, "_water"))
-                   
-            water_pos_list = []
-            for complex_graphs in prediction_list:
-                for complex_graph in complex_graphs:
-                    water_pos_list.append(complex_graph['ligand'].pos.cpu().numpy())
-            
-            all_water_pos = np.concatenate(water_pos_list, axis=0)
-            water_pos = np.asarray([all_water_pos], dtype=np.float32)
-            
-            positions_new = water_pos.squeeze(0) + orig_complex_graph.original_center.cpu().numpy()
-            
-            mad, indices = get_nearest_point_distances(positions_new, real_water_pos)
-            
-            mads.append(mad)
-            full_water_positions.append(water_pos)
-    
-            names.append(orig_complex_graph.name[0])
-
-            end_time = time.time()
-            processing_time = end_time - start_time
-            log_data.append((pdb_name, res_num, f"{processing_time:.2f}"))
-            
-            assert(len(orig_complex_graph.name) == 1) 
-            
-        with open(os.path.join(self.full_cache_path, f"water_positions{'' if self.cache_creation_id is None else '_id' + str(self.cache_creation_id)}.pkl"), 'wb') as f:
-            pickle.dump((full_water_positions, mads), f)
-        with open(os.path.join(self.full_cache_path, f"complex_names_in_same_order{'' if self.cache_creation_id is None else '_id' + str(self.cache_creation_id)}.pkl"), 'wb') as f:
-            pickle.dump((names), f)
-        
-        with open(f"{log_dir}/processing_log_rr{total_resample_ratio}.txt", "w") as log_file:
-            for record in log_data:
-                log_file.write(f"{record[0]} {record[1]} {record[2]}\n")
 
 
 
