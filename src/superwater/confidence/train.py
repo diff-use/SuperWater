@@ -181,8 +181,14 @@ def train(args, model, optimizer, scheduler, train_loader, val_loader, run_dir, 
         metric_is_finite = math.isfinite(float(metric_value))
         if not metric_is_finite and is_main:
             print(f"| WARNING: non-finite validation metric {args.main_metric}={metric_value}; skipping scheduler/best checkpoint")
-        if scheduler and metric_is_finite:
-            scheduler.step(metric_value)
+        if scheduler:
+            # ReduceLROnPlateau needs the monitored metric (and only on finite values);
+            # epoch schedulers (cosine) advance once per epoch regardless.
+            if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                if metric_is_finite:
+                    scheduler.step(metric_value)
+            else:
+                scheduler.step()
 
         state_dict = bare_model.state_dict() if is_main else None
         improved = metric_is_finite and (

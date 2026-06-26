@@ -63,6 +63,10 @@ def get_optimizer_and_scheduler(args, model, scheduler_mode='min'):
     if args.scheduler == 'plateau':
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode=scheduler_mode, factor=0.7,
                                                                patience=args.scheduler_patience, min_lr=args.lr / 100)
+    elif args.scheduler == 'cosine':
+        # Smooth decay from lr to lr/100 over the run — steps every epoch (no plateau detection),
+        # so it actually changes the LR (unlike plateau with patience >= n_epochs, a no-op).
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.n_epochs, eta_min=args.lr / 100)
     else:
         print('No scheduler')
         scheduler = None
